@@ -3,17 +3,28 @@
 A distributed log aggregator in Go, modeled on Apache Flume's
 source → channel → sink architecture, built on gRPC + Protocol Buffers.
 
-```
- producers            edge agent                      collector agent
-┌──────────┐   gRPC   ┌───────────────────────┐  gRPC  ┌───────────────────────┐
-│  app /   │ ───────▶ │ FileTailSource         │──────▶ │ GRPCSource             │
-│ loadgen  │          │      │                 │        │      │                 │
-└──────────┘          │      ▼                 │        │      ▼                 │
-                       │ MemoryChannel (sharded)│        │ FileChannel (WAL)      │
-                       │      │                 │        │      │                 │
-                       │      ▼                 │        │      ▼                 │
-                       │ GRPCSink (pipelined)   │        │ FileSink (rolling)     │
-                       └───────────────────────┘        └───────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Producers
+        APP["app / loadgen"]
+    end
+
+    subgraph EdgeAgent["Edge Agent"]
+        FTS["FileTailSource"]
+        MC["MemoryChannel (sharded)"]
+        GS["GRPCSink (pipelined)"]
+        FTS --> MC --> GS
+    end
+
+    subgraph CollectorAgent["Collector Agent"]
+        GSrc["GRPCSource"]
+        FC["FileChannel (WAL)"]
+        FS["FileSink (rolling)"]
+        GSrc --> FC --> FS
+    end
+
+    APP -- "gRPC" --> FTS
+    GS -- "gRPC" --> GSrc
 ```
 
 Any number of these agents can be chained: a sink in one agent is a gRPC
