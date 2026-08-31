@@ -1,0 +1,29 @@
+# For exercising graceful shutdown / controlled draining: a durable file
+# channel (so a real backlog is visible and bounded by genuine disk I/O)
+# feeding a "null" sink. Send SIGTERM/SIGINT once to start a graceful
+# drain (ingestion stops immediately; the sink keeps flushing whatever's
+# buffered until channels are empty or drain_timeout elapses); send a
+# second signal during that drain to force an immediate quit instead.
+agent_id: shutdown-test
+http_addr: ":9100"
+drain_timeout: 20s
+
+channels:
+  - name: main
+    type: file
+    dir: ./data/shutdown-test/wal
+    capacity: 2000000
+    max_segment_bytes: 268435456
+
+sources:
+  - name: ingest
+    type: grpc
+    channel: main
+    listen_addr: ":6000"
+
+sinks:
+  - name: slow-drain
+    type: "null"
+    channel: main
+    batch_size: 20
+    batch_linger: 300ms

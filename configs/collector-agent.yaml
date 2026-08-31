@@ -1,0 +1,28 @@
+# Collector agent: receives forwarded batches from edge agents and persists
+# them to rolling files. Uses a durable file channel so buffered-but-not-yet
+# -written events survive a restart, at some throughput cost versus memory.
+agent_id: collector-1
+http_addr: ":9101"
+
+channels:
+  - name: main
+    type: file
+    dir: ./data/collector-1/wal
+    capacity: 100000
+    max_segment_bytes: 67108864 # 64MiB
+
+sources:
+  - name: from-edge
+    type: grpc
+    channel: main
+    listen_addr: ":7000"
+
+sinks:
+  - name: to-disk
+    type: file
+    channel: main
+    dir: ./data/collector-1/out
+    batch_size: 1000
+    batch_linger: 250ms
+    roll_max_bytes: 134217728 # 128MiB
+    roll_interval: 5m

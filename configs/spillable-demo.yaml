@@ -1,0 +1,29 @@
+# Deliberately tiny memory primary (500 events) so a burst forces events to
+# spill to the durable file overflow - watch the `spilled` counter in
+# /stats climb. A slow null sink (long batch_linger) keeps the channel from
+# draining quickly, so the burst has to spill instead of just passing
+# straight through.
+agent_id: spillable-demo
+http_addr: ":9100"
+
+channels:
+  - name: main
+    type: spillable
+    capacity: 500          # primary (memory) capacity
+    shards: 4
+    dir: ./data/spillable-demo/overflow
+    overflow_capacity: 500000
+    poll_interval: 5ms
+
+sources:
+  - name: ingest
+    type: grpc
+    channel: main
+    listen_addr: ":6000"
+
+sinks:
+  - name: slow-drain
+    type: "null"
+    channel: main
+    batch_size: 200
+    batch_linger: 20ms

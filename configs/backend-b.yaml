@@ -1,0 +1,9 @@
+# Second target - see configs/backend-a.yaml.
+agent_id: backend-b
+http_addr: ":9201"
+channels:
+  - {name: main, type: memory, capacity: 20000, shards: 4}
+sources:
+  - {name: in, type: grpc, channel: main, listen_addr: ":7001"}
+sinks:
+  - {name: out, type: "null", channel: main, batch_size: 200, batch_linger: 100ms}

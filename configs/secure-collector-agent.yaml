@@ -1,0 +1,32 @@
+# Same shape as collector-agent.yaml, but the gRPC source requires mutual
+# TLS plus a bearer token, matched by the sink config in
+# secure-edge-agent.yaml. Generate certs first: ./scripts/gen-certs.sh
+agent_id: secure-collector
+http_addr: ":9101"
+
+channels:
+  - name: main
+    type: memory
+    capacity: 100000
+    shards: 8
+
+sources:
+  - name: from-edge
+    type: grpc
+    channel: main
+    listen_addr: ":7000"
+    auth_token: "s3cret-demo-token"
+    tls:
+      enabled: true
+      cert_file: certs/server-cert.pem
+      key_file: certs/server-key.pem
+      client_auth: true
+      ca_file: certs/ca-cert.pem
+
+sinks:
+  - name: to-disk
+    type: file
+    channel: main
+    dir: ./data/secure-collector/out
+    batch_size: 1000
+    batch_linger: 250ms

@@ -1,0 +1,31 @@
+# Same as standalone.yaml, but the gRPC source requires mutual TLS (the
+# client must present a cert signed by our demo CA) plus a bearer token.
+# Generate certs first: ./scripts/gen-certs.sh
+agent_id: secure-standalone
+http_addr: ":9100"
+
+channels:
+  - name: main
+    type: memory
+    capacity: 50000
+    shards: 8
+
+sources:
+  - name: ingest
+    type: grpc
+    channel: main
+    listen_addr: ":6000"
+    auth_token: "s3cret-demo-token"
+    tls:
+      enabled: true
+      cert_file: certs/server-cert.pem
+      key_file: certs/server-key.pem
+      client_auth: true
+      ca_file: certs/ca-cert.pem
+
+sinks:
+  - name: discard
+    type: "null"
+    channel: main
+    batch_size: 1000
+    batch_linger: 100ms

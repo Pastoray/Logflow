@@ -1,0 +1,58 @@
+# Demonstrates interceptors, a multiplexing channel selector, and both
+# sink-group processors (load balance + failover), all in one agent for
+# easy local testing. Point loadgen at :6000 and send some events with an
+# "env" header of "prod" vs anything else to see multiplexing in action;
+# start/stop the target agents on :7000/:7001 (load balance) and
+# :7100/:7101 (failover) to see the processors react.
+agent_id: multiplex-demo
+http_addr: ":9100"
+
+channels:
+  - name: prod
+    type: memory
+    capacity: 20000
+    shards: 4
+  - name: default
+    type: memory
+    capacity: 20000
+    shards: 4
+
+sources:
+  - name: ingest
+    type: grpc
+    listen_addr: ":6000"
+    channels: [prod, default]
+    selector:
+      type: multiplexing
+      header: env
+      mapping:
+        prod: [prod]
+      default: [default]
+    interceptors:
+      - type: timestamp
+        params:
+          header: ingest_ts
+      - type: host
+        params:
+          header: agent_host
+      - type: regex_filter
+        params:
+          pattern: "^\\s*$"
+          exclude: "true"   # drop blank lines
+
+sinks:
+  - name: default-out
+    type: "null"
+    channel: default
+    batch_size: 500
+    batch_linger: 100ms
+
+sink_groups:
+  - name: prod-forward
+    channel: prod
+    processor: load_balance
+    selector: round_robin
+    targets: ["127.0.0.1:7000", "127.0.0.1:7001"]
+    parallelism: 2
+    batch_size: 200
+    batch_linger: 150ms

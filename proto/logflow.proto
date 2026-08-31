@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package logflow.v1;
+
+option go_package = "logflow/gen/logflowpb";
+
+message Event {
+  bytes body = 1;
+  map<string, string> headers = 2;
+  int64 timestamp_unix_nano = 3;
+}
+
+message EventBatch {
+  string batch_id = 1;
+  repeated Event events = 2;
+  string source_agent = 3;
+  bool body_compressed = 4;
+}
+
+message AckResponse {
+  string batch_id = 1;
+  bool success = 2;
+  string error = 3;
+  int64 events_received = 4;
+}
+
+message StatsRequest {}
+
+message ChannelStats {
+  int64 capacity = 1;
+  int64 size = 2;
+  int64 put_count = 3;
+  int64 take_count = 4;
+  int64 dropped_count = 5;
+}
+
+message StatsResponse {
+  string agent_id = 1;
+  map<string, ChannelStats> channels = 2;
+  int64 uptime_seconds = 3;
+  int64 events_in_total = 4;
+  int64 events_out_total = 5;
+}
+
+message PingRequest {
+  string agent_id = 1;
+}
+
+message PingResponse {
+  bool ok = 1;
+  string agent_id = 2;
+  int64 timestamp_unix_nano = 3;
+}
+
+service Collector {
+  rpc StreamEvents(stream EventBatch) returns (stream AckResponse);
+
+  rpc SendBatch(EventBatch) returns (AckResponse);
+
+  rpc GetStats(StatsRequest) returns (StatsResponse);
+
+  rpc Ping(PingRequest) returns (PingResponse);
+}

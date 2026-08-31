@@ -1,0 +1,33 @@
+# Edge agent: tails a local application log and forwards batches to the
+# collector tier over gRPC. If the collector is unreachable, events pile up
+# in the (bounded) memory channel and the source blocks/backpressures until
+# it recovers or the channel fills, at which point new lines are dropped
+# and counted in logflow_events_dropped_total.
+agent_id: edge-1
+http_addr: ":9100"
+
+channels:
+  - name: main
+    type: memory
+    capacity: 20000
+    shards: 4
+
+sources:
+  - name: app-log
+    type: filetail
+    channel: main
+    path: /var/log/app/app.log
+    poll_interval: 300ms
+
+sinks:
+  - name: forward-to-collector
+    type: grpc
+    channel: main
+    target_addr: 127.0.0.1:7000
+    batch_size: 500
+    batch_linger: 200ms
+    parallelism: 4
+    in_flight_batches: 8
+    max_retries: 5
+    retry_backoff: 500ms
+    compression: true

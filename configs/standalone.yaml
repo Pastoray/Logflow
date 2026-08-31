@@ -1,0 +1,23 @@
+# Single-process agent for local testing: run the loadgen client against
+# this agent's gRPC source and watch events counted out through /stats.
+agent_id: standalone
+http_addr: ":9100"
+
+channels:
+  - name: main
+    type: memory
+    capacity: 50000
+    shards: 8
+
+sources:
+  - name: ingest
+    type: grpc
+    channel: main
+    listen_addr: ":6000"
+
+sinks:
+  - name: discard
+    type: "null"
+    channel: main
+    batch_size: 1000
+    batch_linger: 100ms

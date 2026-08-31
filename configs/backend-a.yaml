@@ -1,0 +1,11 @@
+# Minimal receiving agent used as a target by the load-balance sink group in
+# configs/multiplex-demo.yaml and as the primary in the failover group in
+# configs/failover-demo.yaml.
+agent_id: backend-a
+http_addr: ":9200"
+channels:
+  - {name: main, type: memory, capacity: 20000, shards: 4}
+sources:
+  - {name: in, type: grpc, channel: main, listen_addr: ":7000"}
+sinks:
+  - {name: out, type: "null", channel: main, batch_size: 200, batch_linger: 100ms}

@@ -1,0 +1,25 @@
+# Demonstrates active WAL retention/purging: tiny segments (so a modest
+# burst forces several rolls) and a short retention_max_age (so purging is
+# observable within seconds instead of days). No sink is attached, so
+# nothing is ever consumed - every purge here discards unconsumed data,
+# making the effect obvious in both the logs and `purged_unconsumed` in
+# /stats.
+agent_id: retention-demo
+http_addr: ":9100"
+
+channels:
+  - name: main
+    type: file
+    dir: ./data/retention-demo/wal
+    capacity: 1000000
+    max_segment_bytes: 4096       # tiny, to force frequent rolls
+    retention_max_age: 3s
+    compaction_interval: 1s
+
+sources:
+  - name: ingest
+    type: grpc
+    channel: main
+    listen_addr: ":6000"
+
+sinks: []

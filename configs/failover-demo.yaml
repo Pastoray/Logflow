@@ -1,0 +1,14 @@
+agent_id: failover-demo
+http_addr: ":9100"
+channels:
+  - {name: main, type: memory, capacity: 20000, shards: 4}
+sources:
+  - {name: ingest, type: grpc, channel: main, listen_addr: ":6000"}
+sink_groups:
+  - name: forward
+    channel: main
+    processor: failover
+    targets: ["127.0.0.1:7000", "127.0.0.1:7001"]
+    batch_size: 100
+    batch_linger: 100ms
+    recovery_probe_interval: 3s
