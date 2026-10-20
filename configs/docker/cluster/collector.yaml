@@ -1,0 +1,56 @@
+# One member of a 3-node clustered collector group for
+# docker-compose.cluster.yml (see the README's "Clustered collector (Raft)"
+# section). ALL THREE services run this same file: the only per-node values
+# come from the environment (NODE_ID, set per service in the compose file),
+# via environment-variable expansion at load time.
+#
+# Peer addresses are the compose service names - other nodes dial those.
+# listen_addr / client_listen_addr are what this node actually BINDS, kept
+# separate from the advertised peer addresses (BIND_IP is empty in a
+# container, i.e. bind all interfaces; it exists so the same file can also
+# be run as three local processes on 127.0.0.11-13 - see the README).
+agent_id: ${NODE_ID}
+http_addr: "${BIND_IP:-}:9101"
+drain_timeout: 30s
+
+channels:
+  - name: main
+    type: file
+    dir: ${DATA_DIR:-/app/data}/wal
+    capacity: 100000
+    max_segment_bytes: 67108864 # 64MiB
+    cluster:
+      node_id: ${NODE_ID}
+      listen_addr: "${BIND_IP:-}:8301"
+      client_listen_addr: "${BIND_IP:-}:8311"
+      data_dir: ${DATA_DIR:-/app/data}/raft
+      peers:
+        - {id: cluster-1, addr: "cluster-1:8301", client_addr: "cluster-1:8311"}
+        - {id: cluster-2, addr: "cluster-2:8301", client_addr: "cluster-2:8311"}
+        - {id: cluster-3, addr: "cluster-3:8301", client_addr: "cluster-3:8311"}
+      election_timeout_min: 300ms
+      election_timeout_max: 600ms
+      heartbeat_interval: 100ms
+      apply_timeout: 5s
+      batch_size: 200
+      batch_linger: 50ms
+      # Keep the Raft log bounded (see "Log compaction": a member that
+      # catches up by snapshot lacks the events it skipped).
+      snapshot_threshold: 5000
+
+sources:
+  - name: from-edge
+    type: grpc
+    channel: main
+    listen_addr: "${BIND_IP:-}:7000"
+
+# Only the current leader's sink writes output (see /stats).
+sinks:
+  - name: to-disk
+    type: file
+    channel: main
+    dir: ${DATA_DIR:-/app/data}/out
+    batch_size: 500
+    batch_linger: 200ms
+    roll_max_bytes: 134217728
+    roll_interval: 5m

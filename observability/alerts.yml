@@ -1,0 +1,95 @@
+# Prometheus alert rules for logflow, loaded via prometheus.yml's
+# rule_files:. Thresholds are tuned for the demo topology (2 edges, 2
+# collectors, synthetic loadgen traffic) - tighten/loosen `for:` windows
+# and thresholds for a real deployment's traffic volume.
+groups:
+  - name: logflow
+    rules:
+      # An agent's /metrics endpoint stopped responding to scrapes -
+      # covers both a crashed process and a network partition from
+      # Prometheus's point of view.
+      - alert: LogflowTargetDown
+        expr: up{job=~"collector-.*|edge-.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "logflow target {{ $labels.job }} is down"
+          description: "Prometheus has not been able to scrape {{ $labels.instance }} (job {{ $labels.job }}) for at least 1 minute."
+
+      # events_dropped_total only increments when a sink group's
+      # retry/load-balance logic gives up on a batch outright (not a
+      # transient retry) - any increase here is real, undelivered data.
+      - alert: LogflowEventsDropped
+        expr: increase(logflow_events_dropped_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "logflow is dropping events on {{ $labels.job }}"
+          description: "{{ $labels.job }} dropped {{ $value }} events in the last 5m (sink group exhausted retries/targets)."
+
+      # Channel-level drop (channel full, producer backpressure resolved
+      # by discarding) - distinct from events_dropped_total (sink-side).
+      - alert: LogflowChannelDropped
+        expr: increase(logflow_channel_dropped_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "logflow channel {{ $labels.channel }} on {{ $labels.job }} is dropping events"
+          description: "Channel {{ $labels.channel }} on {{ $labels.job }} dropped {{ $value }} events in the last 5m - it's filling faster than it's being drained."
+
+      # Leading indicator for the above: channel is most of the way full.
+      # Catches sustained backpressure before it actually starts dropping.
+      - alert: LogflowChannelNearFull
+        expr: (logflow_channel_size / logflow_channel_capacity) > 0.8
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "logflow channel {{ $labels.channel }} on {{ $labels.job }} is over 80% full"
+          description: "Channel {{ $labels.channel }} on {{ $labels.job }} has been over 80% full for 2m ({{ $value | humanizePercentage }}) - downstream isn't keeping up."
+
+      # Forward attempts are failing (target unreachable, rejecting
+      # writes, etc.) even if the sink group is still retrying/not yet
+      # dropping - an early signal something downstream is unhealthy.
+      - alert: LogflowForwardFailuresHigh
+        expr: rate(logflow_events_forward_failed_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "logflow forward failures on {{ $labels.job }}"
+          description: "{{ $labels.job }} is failing to forward events to its sink target(s) ({{ $value | printf \"%.2f\" }}/s over 5m)."
+
+      # Collector restarted and found WAL data older than its retention
+      # window - this is real, already-lost data (not a drop that was
+      # ever a choice), so it's critical even though it's low-frequency.
+      - alert: LogflowPurgedUnconsumed
+        expr: increase(logflow_channel_purged_unconsumed_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "logflow purged unconsumed data on {{ $labels.job }}"
+          description: "Channel {{ $labels.channel }} on {{ $labels.job }} purged {{ $value }} unconsumed, retention-expired events in the last 5m - this data is gone."
+
+      # p95 batch send latency climbing - precedes timeouts/backpressure
+      # under real load even before anything actually drops.
+      - alert: LogflowBatchLatencyHigh
+        expr: histogram_quantile(0.95, sum(rate(logflow_batch_send_duration_seconds_bucket[5m])) by (le, job)) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "logflow p95 batch send latency high on {{ $labels.job }}"
+          description: "{{ $labels.job }}'s p95 batch send latency has been over 1s for 2m ({{ $value | printf \"%.2f\" }}s)."
+
+      # A clustered node whose Raft applier is blocked writing a committed
+      # entry into its own local channel (e.g. permanently full): its vote
+      # still counts toward quorum, so enough of these stall the group.
+      - alert: LogflowClusterApplyStuck
+        expr: logflow_cluster_apply_stuck == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "logflow cluster apply stuck on {{ $labels.job }} (channel {{ $labels.channel }})"
+          description: "{{ $labels.job }}'s Raft applier for channel {{ $labels.channel }} has been blocked on its local channel for over 1m - this node's contribution to quorum is stalled until the local channel drains."

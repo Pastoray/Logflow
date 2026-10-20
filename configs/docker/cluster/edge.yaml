@@ -1,0 +1,26 @@
+# Edge agent for docker-compose.cluster.yml: spreads batches over all three
+# cluster members (any member accepts writes and forwards to its Raft
+# leader), and routes around a dead one.
+agent_id: edge-cluster
+http_addr: ":9100"
+drain_timeout: 30s
+
+channels:
+  - {name: main, type: memory, capacity: 20000, shards: 4}
+
+sources:
+  - {name: ingest, type: grpc, channel: main, listen_addr: ":6000"}
+
+sink_groups:
+  - name: forward-to-cluster
+    channel: main
+    processor: load_balance
+    selector: round_robin
+    targets: ["cluster-1:7000", "cluster-2:7000", "cluster-3:7000"]
+    parallelism: 3
+    batch_size: 500
+    batch_linger: 200ms
+    in_flight_batches: 8
+    max_retries: 10
+    retry_backoff: 500ms
+    compression: true

@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - 00-namespace.yaml
+  - 01-configmap.yaml
+  - 10-collector-1.yaml
+  - 11-collector-2.yaml
+  - 20-edge-1.yaml
+  - 21-edge-2.yaml
+  - 30-loadgen.yaml
+  - 40-observability-config.yaml
+  - 41-prometheus.yaml
+  - 42-grafana.yaml
+  - 43-alertmanager.yaml

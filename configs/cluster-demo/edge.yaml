@@ -1,0 +1,38 @@
+# Feeds the 3-node clustered collector group in collector-{1,2,3}.yaml.
+#
+# Note this edge needs its own failover across the 3 collectors' gRPC
+# *source* addresses, same as it would against any non-clustered
+# multi-collector topology - Raft clustering replicates the data once a
+# write lands on some node, it doesn't give the edge a single virtual
+# endpoint to dial. If the specific node this edge is currently connected
+# to is killed (leader or not), the connection itself drops and this
+# failover group is what gets traffic moving again, not the Raft layer -
+# the Raft layer is what makes the node it fails over to already have
+# every event committed before this edge died, not what re-dials for it.
+agent_id: edge-1
+http_addr: "127.0.0.1:9100"
+drain_timeout: 10s
+
+channels:
+  - name: main
+    type: memory
+    capacity: 20000
+    shards: 4
+
+sources:
+  - name: ingest
+    type: grpc
+    channel: main
+    listen_addr: "127.0.0.1:6000"
+
+sink_groups:
+  - name: forward-to-cluster
+    channel: main
+    processor: failover
+    targets: ["127.0.0.1:7001", "127.0.0.1:7002", "127.0.0.1:7003"]
+    batch_size: 200
+    batch_linger: 200ms
+    in_flight_batches: 4
+    max_retries: 5
+    retry_backoff: 300ms
+    recovery_probe_interval: 2s

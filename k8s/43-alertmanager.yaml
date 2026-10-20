@@ -1,0 +1,49 @@
+# Alertmanager, receiving alerts fired by the prometheus Deployment's rule
+# evaluation (41-prometheus.yaml), using the exact same
+# observability/alertmanager.yml (see 40-observability-config.yaml) as
+# docker-compose.yml's alertmanager service. Prometheus finds it via the
+# Service name "alertmanager" on port 9093, same as prometheus.yml's
+# alerting: block names it for Docker Compose.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: logflow
+  labels: {app: alertmanager}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: alertmanager}
+  template:
+    metadata:
+      labels: {app: alertmanager}
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - {name: http, containerPort: 9093}
+          volumeMounts:
+            - {name: config, mountPath: /etc/alertmanager, readOnly: true}
+            - {name: data, mountPath: /alertmanager}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi}
+      volumes:
+        - name: config
+          configMap: {name: alertmanager-config}
+        - name: data
+          emptyDir: {} # demo-scale: no PVC, notification/silence state doesn't need to survive a restart here
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: logflow
+spec:
+  selector: {app: alertmanager}
+  ports:
+    - {name: http, port: 9093, targetPort: 9093}

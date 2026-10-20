@@ -1,0 +1,76 @@
+{
+  "title": "logflow",
+  "uid": "logflow-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "5s",
+  "time": {"from": "now-15m", "to": "now"},
+  "panels": [
+    {
+      "id": 1,
+      "title": "Events received (per agent)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "evps"}, "overrides": []},
+      "targets": [
+        {"expr": "rate(logflow_events_received_total[1m])", "legendFormat": "{{job}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Events forwarded vs. failed (per agent)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "evps"}, "overrides": []},
+      "targets": [
+        {"expr": "rate(logflow_events_forwarded_total[1m])", "legendFormat": "{{job}} forwarded", "refId": "A"},
+        {"expr": "rate(logflow_events_forward_failed_total[1m])", "legendFormat": "{{job}} failed", "refId": "B"}
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Channel fill (size / capacity)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "max": 1, "min": 0}, "overrides": []},
+      "targets": [
+        {"expr": "logflow_channel_size / logflow_channel_capacity", "legendFormat": "{{job}}/{{channel}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Dropped events (source + channel)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "fieldConfig": {"defaults": {"unit": "evps"}, "overrides": []},
+      "targets": [
+        {"expr": "rate(logflow_events_dropped_total[1m])", "legendFormat": "{{job}} source-drop", "refId": "A"},
+        {"expr": "rate(logflow_channel_dropped_total[1m])", "legendFormat": "{{job}}/{{channel}} channel-drop", "refId": "B"}
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Batch send latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum(rate(logflow_batch_send_duration_seconds_bucket[1m])) by (le, job))", "legendFormat": "{{job}} p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum(rate(logflow_batch_send_duration_seconds_bucket[1m])) by (le, job))", "legendFormat": "{{job}} p95", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum(rate(logflow_batch_send_duration_seconds_bucket[1m])) by (le, job))", "legendFormat": "{{job}} p99", "refId": "C"}
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Spilled / purged-unconsumed (cumulative)",
+      "type": "stat",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "targets": [
+        {"expr": "logflow_channel_spilled_total", "legendFormat": "{{job}}/{{channel}} spilled", "refId": "A"},
+        {"expr": "logflow_channel_purged_unconsumed_total", "legendFormat": "{{job}}/{{channel}} purged", "refId": "B"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+# Edge-2: stateless (memory channel only, no PVC) - unlike the collectors,
+# this could run as a multi-replica Deployment behind a Service with no
+# config changes needed, since nothing but the gRPC listen port is
+# per-replica state. It's kept at one replica here only to mirror
+# docker-compose's topology 1:1.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-2
+  namespace: logflow
+  labels: {app: edge-2, tier: edge}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: edge-2}
+  template:
+    metadata:
+      labels: {app: edge-2, tier: edge}
+    spec:
+      containers:
+        - name: agent
+          image: logflow:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/app/configs/docker/edge-2.yaml"]
+          ports:
+            - {name: grpc, containerPort: 6000}
+            - {name: http, containerPort: 9100}
+          volumeMounts:
+            - {name: config, mountPath: /app/configs/docker, readOnly: true}
+          readinessProbe:
+            exec: {command: ["/app/healthcheck", "http://localhost:9100/healthz"]}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            exec: {command: ["/app/healthcheck", "http://localhost:9100/healthz"]}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi}
+      volumes:
+        - name: config
+          configMap: {name: logflow-agent-configs}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge-2
+  namespace: logflow
+spec:
+  selector: {app: edge-2}
+  ports:
+    - {name: grpc, port: 6000, targetPort: 6000}
+    - {name: http, port: 9100, targetPort: 9100}

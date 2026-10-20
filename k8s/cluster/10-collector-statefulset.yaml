@@ -1,0 +1,74 @@
+# Three-member Raft collector group as a StatefulSet. Each pod gets a stable
+# name (collector-0..2) and a stable DNS name through the headless Service
+# below - exactly what a static Raft peer list needs. All pods run the SAME
+# ConfigMap; the per-pod identity comes from the pod name (downward API ->
+# NODE_ID). Peers dial each other by DNS name while each node binds :8301 /
+# :8311 itself (listen_addr), so a pod doesn't need its own DNS record to
+# resolve before it can start.
+apiVersion: v1
+kind: Service
+metadata:
+  name: collector-raft
+  namespace: logflow-cluster
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true # peers must resolve each other before any pod is Ready
+  selector: {app: collector}
+  ports:
+    - {name: raft, port: 8301}
+    - {name: raft-client, port: 8311}
+    - {name: grpc, port: 7000}
+    - {name: http, port: 9101}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: collector
+  namespace: logflow-cluster
+  labels: {app: collector, tier: collector}
+spec:
+  serviceName: collector-raft
+  replicas: 3 # the peer list in the ConfigMap names exactly 3; changing this needs a live membership change, not just a scale
+  podManagementPolicy: Parallel # a quorum has to come up together to elect a leader
+  selector:
+    matchLabels: {app: collector}
+  template:
+    metadata:
+      labels: {app: collector, tier: collector}
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: agent
+          image: logflow:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/app/configs/cluster/collector.yaml"]
+          env:
+            - name: NODE_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          ports:
+            - {name: grpc, containerPort: 7000}
+            - {name: http, containerPort: 9101}
+            - {name: raft, containerPort: 8301}
+            - {name: raft-client, containerPort: 8311}
+          volumeMounts:
+            - {name: data, mountPath: /app/data}
+            - {name: config, mountPath: /app/configs/cluster, readOnly: true}
+          readinessProbe:
+            exec: {command: ["/app/healthcheck", "http://localhost:9101/healthz"]}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            exec: {command: ["/app/healthcheck", "http://localhost:9101/healthz"]}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - name: config
+          configMap: {name: logflow-cluster-configs}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: {requests: {storage: 2Gi}}

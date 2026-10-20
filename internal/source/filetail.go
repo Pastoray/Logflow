@@ -14,6 +14,9 @@ import (
 	"logflow/internal/router"
 )
 
+// FileTailSource follows a file the way `tail -F` does: it reads new lines
+// as they are appended and re-opens the file if it is rotated (truncated or
+// replaced), turning each line into one Event.
 type FileTailSource struct {
 	Name         string
 	Path         string
@@ -41,6 +44,8 @@ func (f *FileTailSource) Run(ctx context.Context) error {
 		return nil
 	}
 
+	// Wait for the file to exist rather than failing hard, since it's common
+	// for the target application to create it after the agent starts.
 	for {
 		if err := open(); err == nil {
 			break
@@ -77,6 +82,7 @@ func (f *FileTailSource) Run(ctx context.Context) error {
 						e = f.Interceptors.Intercept(e)
 					}
 					if e == nil {
+						// dropped by an interceptor
 					} else if perr := f.Router.Put(ctx, e); perr != nil {
 						log.Printf("[source:%s] drop line, channel put failed: %v", f.Name, perr)
 					} else if f.Metrics != nil {
@@ -93,6 +99,7 @@ func (f *FileTailSource) Run(ctx context.Context) error {
 			}
 			if fi, statErr := os.Stat(f.Path); statErr == nil {
 				if curOff, _ := file.Seek(0, io.SeekCurrent); fi.Size() < curOff {
+					// File was truncated/rotated; reopen from the start.
 					file.Close()
 					if err := open(); err != nil {
 						log.Printf("[source:%s] reopen failed: %v", f.Name, err)

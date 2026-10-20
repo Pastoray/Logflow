@@ -7,6 +7,11 @@ import (
 	"time"
 )
 
+// TestFileChannelRetentionPurgesUnconsumed verifies that an active
+// retention sweep will purge a closed segment that has exceeded MaxAge,
+// even though it still has unconsumed entries sitting in it - the
+// distinguishing behavior from the reactive full-consumption GC that
+// happens automatically as part of Take().
 func TestFileChannelRetentionPurgesUnconsumed(t *testing.T) {
 	dir, err := os.MkdirTemp("", "logflow-retention-test")
 	if err != nil {
@@ -14,6 +19,9 @@ func TestFileChannelRetentionPurgesUnconsumed(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
+	// A tiny max segment size so a handful of events forces multiple
+	// segments to exist (only closed, non-active segments are eligible
+	// for purging).
 	fc, err := NewFileChannel("t", dir, 10000, 200, RetentionPolicy{
 		MaxAge:   50 * time.Millisecond,
 		Interval: 20 * time.Millisecond,
@@ -24,7 +32,9 @@ func TestFileChannelRetentionPurgesUnconsumed(t *testing.T) {
 	defer fc.Close()
 
 	ctx := context.Background()
-
+	// Write enough events, with big enough bodies, to roll past the tiny
+	// 200-byte segment size several times over, leaving earlier segments
+	// closed (and, since we never Take() any of them, fully unconsumed).
 	for i := 0; i < 30; i++ {
 		e := &Event{Body: []byte("padding-to-force-segment-rolls-0123456789"), Timestamp: time.Now()}
 		if err := fc.Put(ctx, e); err != nil {
@@ -38,6 +48,7 @@ func TestFileChannelRetentionPurgesUnconsumed(t *testing.T) {
 	}
 	before := len(entries)
 
+	// Wait past MaxAge plus a couple of sweep intervals.
 	time.Sleep(200 * time.Millisecond)
 
 	entries, _ = os.ReadDir(dir)
@@ -51,6 +62,9 @@ func TestFileChannelRetentionPurgesUnconsumed(t *testing.T) {
 	t.Logf("segments before=%d after=%d purgedUnconsumed=%d", before, after, fc.PurgedUnconsumed())
 }
 
+// TestFileChannelNoRetentionKeepsSegments confirms that with no
+// RetentionPolicy configured (the default), unconsumed segments are never
+// purged - only the existing full-consumption GC applies.
 func TestFileChannelNoRetentionKeepsSegments(t *testing.T) {
 	dir, err := os.MkdirTemp("", "logflow-no-retention-test")
 	if err != nil {

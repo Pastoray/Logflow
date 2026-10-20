@@ -1,0 +1,50 @@
+# Traffic generators - one per edge agent, same as docker-compose. No
+# Service needed since nothing calls into these; they only dial out to
+# their own edge Service by its in-cluster DNS name.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen-1
+  namespace: logflow
+  labels: {app: loadgen-1}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: loadgen-1}
+  template:
+    metadata:
+      labels: {app: loadgen-1}
+    spec:
+      containers:
+        - name: loadgen
+          image: logflow:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/app/loadgen"]
+          args: ["-addr", "edge-1:6000", "-rate", "2000", "-batch", "200", "-duration", "1h"]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loadgen-2
+  namespace: logflow
+  labels: {app: loadgen-2}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: loadgen-2}
+  template:
+    metadata:
+      labels: {app: loadgen-2}
+    spec:
+      containers:
+        - name: loadgen
+          image: logflow:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/app/loadgen"]
+          args: ["-addr", "edge-2:6000", "-rate", "2000", "-batch", "200", "-duration", "1h"]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 256Mi}

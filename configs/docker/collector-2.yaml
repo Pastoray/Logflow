@@ -1,0 +1,40 @@
+# Collector-tier agent for the docker-compose topology. Receives batches
+# forwarded by the edge tier over gRPC and persists them to a durable WAL
+# file channel, then writes them out to rolling files on a named volume so
+# data survives a `docker compose restart`/container recreation.
+#
+# AGENT_ID is baked in at the container level (compose passes a distinct
+# config per collector); this file is the shared template copied into both
+# collector-1.yaml and collector-2.yaml with only agent_id differing.
+agent_id: collector-2
+http_addr: ":9101"
+drain_timeout: 30s
+
+channels:
+  - name: main
+    type: file
+    dir: /app/data/wal
+    capacity: 100000
+    max_segment_bytes: 67108864 # 64MiB
+    # Keep the on-disk WAL from growing without bound in a long-running
+    # container: purge segments older than 1h or once the WAL exceeds 512MiB,
+    # whichever comes first, checked every 30s.
+    retention_max_age: 1h
+    retention_max_bytes: 536870912
+    compaction_interval: 30s
+
+sources:
+  - name: from-edge
+    type: grpc
+    channel: main
+    listen_addr: ":7000"
+
+sinks:
+  - name: to-disk
+    type: file
+    channel: main
+    dir: /app/data/out
+    batch_size: 1000
+    batch_linger: 250ms
+    roll_max_bytes: 134217728 # 128MiB
+    roll_interval: 5m

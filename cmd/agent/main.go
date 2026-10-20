@@ -1,3 +1,5 @@
+// Command agent runs a single logflow agent process from a YAML config
+// file describing its sources, channels, and sinks.
 package main
 
 import (
@@ -21,6 +23,12 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	// First SIGINT/SIGTERM starts a graceful, controlled drain (see
+	// Agent.Run): ingestion stops immediately, but sinks keep flushing
+	// whatever is already buffered until channels are empty or
+	// drain_timeout elapses. A second signal during that drain forces an
+	// immediate stop instead of waiting it out - the conventional
+	// "I understand this may lose buffered data, stop now" escape hatch.
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 

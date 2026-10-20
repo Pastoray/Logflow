@@ -1,0 +1,72 @@
+# Collector-1: a single-replica Deployment (not a multi-replica
+# StatefulSet) with its own PVC and its own Service name, because
+# configs/docker/collector-1.yaml is addressed by name from the edge
+# agents' sink groups ("collector-1:7000") - the config doesn't know
+# about replica ordinals, so this mirrors docker-compose's topology
+# exactly rather than introducing config templating. See k8s/README.md
+# for the tradeoff and what true horizontal scaling would need instead.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: collector-1-data
+  namespace: logflow
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: collector-1
+  namespace: logflow
+  labels: {app: collector-1, tier: collector}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # only one replica ever writes to the PVC - never run two at once
+  selector:
+    matchLabels: {app: collector-1}
+  template:
+    metadata:
+      labels: {app: collector-1, tier: collector}
+    spec:
+      containers:
+        - name: agent
+          image: logflow:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/app/configs/docker/collector-1.yaml"]
+          ports:
+            - {name: grpc, containerPort: 7000}
+            - {name: http, containerPort: 9101}
+          volumeMounts:
+            - {name: data, mountPath: /app/data}
+            - {name: config, mountPath: /app/configs/docker, readOnly: true}
+          readinessProbe:
+            exec: {command: ["/app/healthcheck", "http://localhost:9101/healthz"]}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            exec: {command: ["/app/healthcheck", "http://localhost:9101/healthz"]}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: collector-1-data}
+        - name: config
+          configMap: {name: logflow-agent-configs}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: collector-1
+  namespace: logflow
+spec:
+  selector: {app: collector-1}
+  ports:
+    - {name: grpc, port: 7000, targetPort: 7000}
+    - {name: http, port: 9101, targetPort: 9101}

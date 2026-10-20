@@ -18,7 +18,7 @@ import (
 
 type FailoverGroupConfig struct {
 	Name            string
-	Targets         []string
+	Targets         []string // priority order; index 0 is primary
 	BatchSize       int
 	BatchLinger     time.Duration
 	InFlightBatches int
@@ -28,9 +28,22 @@ type FailoverGroupConfig struct {
 	TLS             *config.TLSConfig
 	AuthToken       string
 
+	// How often to probe targets with higher priority than the one
+	// currently active, to move traffic back once they recover.
 	RecoveryProbeInterval time.Duration
+
+	// Used only by "file:<dir>" targets - see FileTargetPrefix.
+	FileRollMaxBytes int64
+	FileRollInterval time.Duration
 }
 
+// FailoverGroup is Flume's "failover sink processor": exactly one backend
+// is active at a time, chosen by priority (Targets[0] first). On failure
+// the active backend is marked down and traffic moves to the next
+// available one; a background prober periodically checks whether a
+// higher-priority backend has come back, and promotes it immediately by
+// cancelling the current stream so the drain loop reconnects to it - unlike
+// LoadBalanceGroup, only one backend ever receives traffic at a time.
 type FailoverGroup struct {
 	cfg     FailoverGroupConfig
 	channel channel.Channel
@@ -63,23 +76,40 @@ func (g *FailoverGroup) Run(ctx context.Context) error {
 		g.activeCancel = cancel
 		g.mu.Unlock()
 
-		sub := NewGRPCSink(GRPCSinkConfig{
-			Name: g.cfg.Name + "/" + target, TargetAddr: target,
-			BatchSize: g.cfg.BatchSize, BatchLinger: g.cfg.BatchLinger,
-			Parallelism: 1, InFlightBatches: g.cfg.InFlightBatches,
-			MaxRetries: g.cfg.MaxRetries, RetryBackoff: g.cfg.RetryBackoff,
-			Compression: g.cfg.Compression,
-			TLS:         g.cfg.TLS, AuthToken: g.cfg.AuthToken,
-		}, g.channel, g.metrics)
-
 		log.Printf("[failover:%s] active backend -> %s (priority %d)", g.cfg.Name, target, idx)
-		err := sub.DialAndStreamOnce(subCtx)
+		var err error
+		if IsFileTarget(target) {
+			fs := NewFileSink(FileSinkConfig{
+				Name: g.cfg.Name, Dir: FileTargetDir(target),
+				BatchSize: g.cfg.BatchSize, BatchLinger: g.cfg.BatchLinger,
+				RollMaxBytes: g.cfg.FileRollMaxBytes, RollInterval: g.cfg.FileRollInterval,
+			}, g.channel, g.metrics)
+			err = fs.RunUntilError(subCtx)
+			if err == nil && subCtx.Err() != nil {
+				// Stopped by cancellation (shutdown or a promotion), not a
+				// write failure - report it the way DialAndStreamOnce does
+				// so the loop below tells the two apart.
+				err = subCtx.Err()
+			}
+		} else {
+			sub := NewGRPCSink(GRPCSinkConfig{
+				Name: g.cfg.Name + "/" + target, TargetAddr: target,
+				BatchSize: g.cfg.BatchSize, BatchLinger: g.cfg.BatchLinger,
+				Parallelism: 1, InFlightBatches: g.cfg.InFlightBatches,
+				MaxRetries: g.cfg.MaxRetries, RetryBackoff: g.cfg.RetryBackoff,
+				Compression: g.cfg.Compression,
+				TLS:         g.cfg.TLS, AuthToken: g.cfg.AuthToken,
+			}, g.channel, g.metrics)
+			err = sub.DialAndStreamOnce(subCtx)
+		}
 		cancel()
 
 		if ctx.Err() != nil {
 			return nil
 		}
 		if errors.Is(err, context.Canceled) {
+			// A promotion cancelled us deliberately; loop immediately and
+			// pick up the new currentIdx with no backoff or down-marking.
 			continue
 		}
 
@@ -109,6 +139,9 @@ func (g *FailoverGroup) markDown(idx int) {
 	g.mu.Unlock()
 }
 
+// nextHealthy returns the next target after idx (wrapping) that isn't
+// currently in its down cooldown, or just idx+1 mod N if every target is
+// down - we still have to try something.
 func (g *FailoverGroup) nextHealthy(idx int) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -123,6 +156,11 @@ func (g *FailoverGroup) nextHealthy(idx int) int {
 	return (idx + 1) % n
 }
 
+// recoveryProber periodically pings every backend with strictly higher
+// priority than the currently active one; if any responds, that target is
+// promoted (made current) and the active stream is cancelled so the drain
+// loop reconnects to it right away instead of waiting for the current one
+// to fail on its own.
 func (g *FailoverGroup) recoveryProber(ctx context.Context) {
 	ticker := time.NewTicker(g.cfg.RecoveryProbeInterval)
 	defer ticker.Stop()
@@ -134,7 +172,7 @@ func (g *FailoverGroup) recoveryProber(ctx context.Context) {
 		}
 		cur := g.getCurrentIdx()
 		if cur == 0 {
-			continue
+			continue // already on the top-priority target
 		}
 		for idx := 0; idx < cur; idx++ {
 			if g.pingHealthy(ctx, g.cfg.Targets[idx]) {
@@ -153,6 +191,9 @@ func (g *FailoverGroup) recoveryProber(ctx context.Context) {
 }
 
 func (g *FailoverGroup) pingHealthy(ctx context.Context, target string) bool {
+	if IsFileTarget(target) {
+		return fileTargetHealthy(FileTargetDir(target))
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	creds, err := security.ClientTransportCredentials(g.cfg.TLS)

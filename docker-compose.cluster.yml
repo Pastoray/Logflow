@@ -1,0 +1,120 @@
+# Clustered (Raft) collector tier: three collectors that replicate every
+# event to each other, behind one edge agent that spreads load over all
+# three. Separate from docker-compose.yml (the non-replicated 2-collector
+# topology) - run one or the other, they use different networks/volumes.
+#
+#   make build && docker compose -f docker-compose.cluster.yml up --build
+#   curl -s localhost:19201/stats    # cluster_state / cluster_leader / raft_log_entries
+#
+# Sharded variant (two independent Raft groups on the same 3 nodes):
+#   COLLECTOR_CFG=collector-sharded.yaml docker compose -f docker-compose.cluster.yml up
+#
+# All three collectors run the SAME config file; only NODE_ID differs (env).
+# Kill the leader (`docker compose -f docker-compose.cluster.yml stop cluster-2`
+# or whichever /stats shows as leader) and a new one is elected; the edge
+# routes around the dead node. Only the leader's file sink writes output.
+#
+# NOTE: written and statically validated (YAML + config load + the same
+# config run as three local processes); not run under a Docker daemon in
+# the environment this was authored in.
+
+services:
+  cluster-1:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/agent"]
+    command: ["-config", "/app/configs/docker/cluster/${COLLECTOR_CFG:-collector.yaml}"]
+    environment:
+      NODE_ID: cluster-1
+    volumes:
+      - cluster1-data:/app/data
+    ports:
+      - "19201:9101"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:9101/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [logflow-cluster-net]
+    restart: unless-stopped
+
+  cluster-2:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/agent"]
+    command: ["-config", "/app/configs/docker/cluster/${COLLECTOR_CFG:-collector.yaml}"]
+    environment:
+      NODE_ID: cluster-2
+    volumes:
+      - cluster2-data:/app/data
+    ports:
+      - "19202:9101"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:9101/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [logflow-cluster-net]
+    restart: unless-stopped
+
+  cluster-3:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/agent"]
+    command: ["-config", "/app/configs/docker/cluster/${COLLECTOR_CFG:-collector.yaml}"]
+    environment:
+      NODE_ID: cluster-3
+    volumes:
+      - cluster3-data:/app/data
+    ports:
+      - "19203:9101"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:9101/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [logflow-cluster-net]
+    restart: unless-stopped
+
+  edge-cluster:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/agent"]
+    command: ["-config", "/app/configs/docker/cluster/edge.yaml"]
+    ports:
+      - "19200:9100"
+      - "16100:6000"
+    depends_on:
+      cluster-1: {condition: service_healthy}
+      cluster-2: {condition: service_healthy}
+      cluster-3: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:9100/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [logflow-cluster-net]
+    restart: unless-stopped
+
+  loadgen-cluster:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/loadgen"]
+    command: ["-addr", "edge-cluster:6000", "-rate", "2000", "-batch", "200", "-duration", "1h"]
+    depends_on:
+      edge-cluster: {condition: service_healthy}
+    networks: [logflow-cluster-net]
+    restart: unless-stopped
+
+networks:
+  logflow-cluster-net:
+    driver: bridge
+
+volumes:
+  cluster1-data:
+  cluster2-data:
+  cluster3-data:

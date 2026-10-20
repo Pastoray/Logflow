@@ -1,0 +1,292 @@
+# ConfigMaps carrying observability/*.yml (prometheus.yml, alerts.yml,
+# alertmanager.yml) and the dashboard JSON verbatim into the cluster - same
+# source files docker-compose.yml mounts, just as ConfigMap data instead of
+# bind mounts. Regenerate by hand if those files change (same caveat as
+# k8s/01-configmap.yaml - don't hand-edit the data: blocks themselves,
+# they'll drift silently).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: logflow
+data:
+  prometheus.yml: |
+    # Scrape config for the docker-compose topology (docker-compose.yml):
+    # all 4 agents expose real Prometheus metrics (see internal/metrics) on
+    # their HTTP port's /metrics path. Service names double as both DNS names
+    # and Prometheus `job` labels, so panels can group/filter by job without
+    # any extra relabeling.
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+
+    rule_files:
+      - /etc/prometheus/alerts.yml
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ["alertmanager:9093"]
+
+    scrape_configs:
+      - job_name: collector-1
+        static_configs:
+          - targets: ["collector-1:9101"]
+      - job_name: collector-2
+        static_configs:
+          - targets: ["collector-2:9101"]
+      - job_name: edge-1
+        static_configs:
+          - targets: ["edge-1:9100"]
+      - job_name: edge-2
+        static_configs:
+          - targets: ["edge-2:9100"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: logflow
+data:
+  alerts.yml: |
+    # Prometheus alert rules for logflow, loaded via prometheus.yml's
+    # rule_files:. Thresholds are tuned for the demo topology (2 edges, 2
+    # collectors, synthetic loadgen traffic) - tighten/loosen `for:` windows
+    # and thresholds for a real deployment's traffic volume.
+    groups:
+      - name: logflow
+        rules:
+          # An agent's /metrics endpoint stopped responding to scrapes -
+          # covers both a crashed process and a network partition from
+          # Prometheus's point of view.
+          - alert: LogflowTargetDown
+            expr: up{job=~"collector-.*|edge-.*"} == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "logflow target {{ $labels.job }} is down"
+              description: "Prometheus has not been able to scrape {{ $labels.instance }} (job {{ $labels.job }}) for at least 1 minute."
+
+          # events_dropped_total only increments when a sink group's
+          # retry/load-balance logic gives up on a batch outright (not a
+          # transient retry) - any increase here is real, undelivered data.
+          - alert: LogflowEventsDropped
+            expr: increase(logflow_events_dropped_total[5m]) > 0
+            labels:
+              severity: warning
+            annotations:
+              summary: "logflow is dropping events on {{ $labels.job }}"
+              description: "{{ $labels.job }} dropped {{ $value }} events in the last 5m (sink group exhausted retries/targets)."
+
+          # Channel-level drop (channel full, producer backpressure resolved
+          # by discarding) - distinct from events_dropped_total (sink-side).
+          - alert: LogflowChannelDropped
+            expr: increase(logflow_channel_dropped_total[5m]) > 0
+            labels:
+              severity: warning
+            annotations:
+              summary: "logflow channel {{ $labels.channel }} on {{ $labels.job }} is dropping events"
+              description: "Channel {{ $labels.channel }} on {{ $labels.job }} dropped {{ $value }} events in the last 5m - it's filling faster than it's being drained."
+
+          # Leading indicator for the above: channel is most of the way full.
+          # Catches sustained backpressure before it actually starts dropping.
+          - alert: LogflowChannelNearFull
+            expr: (logflow_channel_size / logflow_channel_capacity) > 0.8
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "logflow channel {{ $labels.channel }} on {{ $labels.job }} is over 80% full"
+              description: "Channel {{ $labels.channel }} on {{ $labels.job }} has been over 80% full for 2m ({{ $value | humanizePercentage }}) - downstream isn't keeping up."
+
+          # Forward attempts are failing (target unreachable, rejecting
+          # writes, etc.) even if the sink group is still retrying/not yet
+          # dropping - an early signal something downstream is unhealthy.
+          - alert: LogflowForwardFailuresHigh
+            expr: rate(logflow_events_forward_failed_total[5m]) > 0
+            labels:
+              severity: warning
+            annotations:
+              summary: "logflow forward failures on {{ $labels.job }}"
+              description: "{{ $labels.job }} is failing to forward events to its sink target(s) ({{ $value | printf \"%.2f\" }}/s over 5m)."
+
+          # Collector restarted and found WAL data older than its retention
+          # window - this is real, already-lost data (not a drop that was
+          # ever a choice), so it's critical even though it's low-frequency.
+          - alert: LogflowPurgedUnconsumed
+            expr: increase(logflow_channel_purged_unconsumed_total[5m]) > 0
+            labels:
+              severity: critical
+            annotations:
+              summary: "logflow purged unconsumed data on {{ $labels.job }}"
+              description: "Channel {{ $labels.channel }} on {{ $labels.job }} purged {{ $value }} unconsumed, retention-expired events in the last 5m - this data is gone."
+
+          # p95 batch send latency climbing - precedes timeouts/backpressure
+          # under real load even before anything actually drops.
+          - alert: LogflowBatchLatencyHigh
+            expr: histogram_quantile(0.95, sum(rate(logflow_batch_send_duration_seconds_bucket[5m])) by (le, job)) > 1
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "logflow p95 batch send latency high on {{ $labels.job }}"
+              description: "{{ $labels.job }}'s p95 batch send latency has been over 1s for 2m ({{ $value | printf \"%.2f\" }}s)."
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: logflow
+data:
+  alertmanager.yml: |
+    # Minimal Alertmanager config for the demo topology. Routes everything to
+    # a single webhook receiver pointed at a placeholder URL - swap `url:` for
+    # a real endpoint (PagerDuty/Slack/OpsGenie webhook, or add those receiver
+    # types directly) to actually get notified. The routing tree is split by
+    # `severity` purely to demonstrate it; both routes hit the same receiver
+    # here since there's nowhere real to send them from this demo.
+    global:
+      resolve_timeout: 5m
+
+    route:
+      receiver: default
+      group_by: ["alertname", "job"]
+      group_wait: 10s
+      group_interval: 30s
+      repeat_interval: 4h
+      routes:
+        - matchers:
+            - severity="critical"
+          receiver: default
+          repeat_interval: 1h
+
+    receivers:
+      - name: default
+        webhook_configs:
+          - url: "http://localhost:5001/alerts" # placeholder - point this at a real webhook receiver
+            send_resolved: true
+
+    inhibit_rules:
+      # Don't page about drops/latency/forward-failures for a target that's
+      # already firing LogflowTargetDown - it's down, everything downstream
+      # of that fact is noise.
+      - source_matchers:
+          - alertname="LogflowTargetDown"
+        target_matchers:
+          - severity=~"warning|critical"
+        equal: ["job"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: logflow
+data:
+  datasource.yml: |
+    apiVersion: 1
+
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+        editable: true
+  dashboards.yml: |
+    apiVersion: 1
+
+    providers:
+      - name: logflow
+        orgId: 1
+        folder: ""
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: true
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: logflow
+data:
+  logflow.json: |
+    {
+      "title": "logflow",
+      "uid": "logflow-overview",
+      "schemaVersion": 39,
+      "version": 1,
+      "editable": true,
+      "refresh": "5s",
+      "time": {"from": "now-15m", "to": "now"},
+      "panels": [
+        {
+          "id": 1,
+          "title": "Events received (per agent)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+          "fieldConfig": {"defaults": {"unit": "evps"}, "overrides": []},
+          "targets": [
+            {"expr": "rate(logflow_events_received_total[1m])", "legendFormat": "{{job}}", "refId": "A"}
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Events forwarded vs. failed (per agent)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+          "fieldConfig": {"defaults": {"unit": "evps"}, "overrides": []},
+          "targets": [
+            {"expr": "rate(logflow_events_forwarded_total[1m])", "legendFormat": "{{job}} forwarded", "refId": "A"},
+            {"expr": "rate(logflow_events_forward_failed_total[1m])", "legendFormat": "{{job}} failed", "refId": "B"}
+          ]
+        },
+        {
+          "id": 3,
+          "title": "Channel fill (size / capacity)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+          "fieldConfig": {"defaults": {"unit": "percentunit", "max": 1, "min": 0}, "overrides": []},
+          "targets": [
+            {"expr": "logflow_channel_size / logflow_channel_capacity", "legendFormat": "{{job}}/{{channel}}", "refId": "A"}
+          ]
+        },
+        {
+          "id": 4,
+          "title": "Dropped events (source + channel)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+          "fieldConfig": {"defaults": {"unit": "evps"}, "overrides": []},
+          "targets": [
+            {"expr": "rate(logflow_events_dropped_total[1m])", "legendFormat": "{{job}} source-drop", "refId": "A"},
+            {"expr": "rate(logflow_channel_dropped_total[1m])", "legendFormat": "{{job}}/{{channel}} channel-drop", "refId": "B"}
+          ]
+        },
+        {
+          "id": 5,
+          "title": "Batch send latency (p50 / p95 / p99)",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+          "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+          "targets": [
+            {"expr": "histogram_quantile(0.50, sum(rate(logflow_batch_send_duration_seconds_bucket[1m])) by (le, job))", "legendFormat": "{{job}} p50", "refId": "A"},
+            {"expr": "histogram_quantile(0.95, sum(rate(logflow_batch_send_duration_seconds_bucket[1m])) by (le, job))", "legendFormat": "{{job}} p95", "refId": "B"},
+            {"expr": "histogram_quantile(0.99, sum(rate(logflow_batch_send_duration_seconds_bucket[1m])) by (le, job))", "legendFormat": "{{job}} p99", "refId": "C"}
+          ]
+        },
+        {
+          "id": 6,
+          "title": "Spilled / purged-unconsumed (cumulative)",
+          "type": "stat",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "targets": [
+            {"expr": "logflow_channel_spilled_total", "legendFormat": "{{job}}/{{channel}} spilled", "refId": "A"},
+            {"expr": "logflow_channel_purged_unconsumed_total", "legendFormat": "{{job}}/{{channel}} purged", "refId": "B"}
+          ]
+        }
+      ]
+    }

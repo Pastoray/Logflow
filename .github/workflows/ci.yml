@@ -1,0 +1,193 @@
+name: CI
+
+# Build, vet, format-check and test the Go module; build the Docker image;
+# and validate the Docker Compose and Kubernetes deployment manifests, plus
+# the Prometheus/Alertmanager observability configs, on every push and PR.
+#
+# The module's dependencies are vendored under vendor/ (go.mod's `replace`
+# directives point at local clone paths that only existed on the machine
+# they were vendored on - see README's Building section for why). Go 1.14+
+# auto-detects vendor/ and defaults to -mod=vendor with zero network calls,
+# so every `go` invocation below works the same whether or not those
+# replace targets exist on the runner - don't add -mod=mod or `go mod
+# tidy`/`go mod download` anywhere in this file, that would try to resolve
+# them for real and fail.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  test:
+    name: Build, vet, fmt, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false # vendor/ is already in the checkout; no module cache to warm
+
+      # Dependencies are vendored (no module cache to warm), but the Go
+      # *build* cache - compiled vendor packages, and -race instrumented
+      # ones, which are the slow part of `go test -race` - is worth keeping.
+      # Keyed on the vendor tree + go.mod so a dependency change gets a fresh
+      # cache, with the sources hash as the most specific tier: a cache miss
+      # on source change still restores the previous (mostly valid) cache.
+      - name: Cache Go build cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('go.mod', 'vendor/modules.txt') }}-${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('go.mod', 'vendor/modules.txt') }}-
+            go-build-${{ runner.os }}-${{ env.GO_VERSION }}-
+
+      - name: Vendor consistency
+        run: go mod verify
+
+      - name: gofmt
+        run: |
+          fmt_out="$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -v -race ./...
+
+  docker:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # Dependencies are vendored (no module cache to warm), but the Go
+      # *build* cache - compiled vendor packages, and -race instrumented
+      # ones, which are the slow part of `go test -race` - is worth keeping.
+      # Keyed on the vendor tree + go.mod so a dependency change gets a fresh
+      # cache, with the sources hash as the most specific tier: a cache miss
+      # on source change still restores the previous (mostly valid) cache.
+      - name: Cache Go build cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('go.mod', 'vendor/modules.txt') }}-${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('go.mod', 'vendor/modules.txt') }}-
+            go-build-${{ runner.os }}-${{ env.GO_VERSION }}-
+
+      - name: make build
+        run: make build
+
+      - name: docker build
+        run: docker build -t logflow:ci .
+
+      - name: docker compose config
+        run: |
+          docker compose config -q
+          docker compose -f docker-compose.cluster.yml config -q
+
+  manifests:
+    name: Validate Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache kustomize binary
+        id: kcache
+        uses: actions/cache@v4
+        with:
+          path: ~/tools/kustomize
+          key: kustomize-v5.4.3-linux-amd64
+
+      - name: Install kustomize
+        run: |
+          mkdir -p ~/tools
+          if [ ! -x ~/tools/kustomize ]; then
+            curl -sSL -o /tmp/kustomize.tar.gz \
+              "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz"
+            tar xzf /tmp/kustomize.tar.gz -C /tmp
+            mv /tmp/kustomize ~/tools/kustomize
+          fi
+          sudo cp ~/tools/kustomize /usr/local/bin/kustomize
+
+      - name: kustomize build
+        # Renders every object in k8s/ - catches bad kustomization.yaml
+        # entries, malformed YAML, and broken ConfigMap/volume references.
+        # Deliberately not also running a schema validator (kubeconform/
+        # kubectl --dry-run=client) here: this environment's egress policy
+        # blocks both ghcr.io and dl.k8s.io, so neither could be test-run
+        # before being committed, and this project doesn't ship a CI step
+        # nobody has watched pass. See README's Known limitations.
+        run: |
+          kustomize build k8s/ > /tmp/rendered.yaml
+          kustomize build k8s/cluster/ > /tmp/rendered-cluster.yaml
+
+      - name: Cluster ConfigMap is in sync with configs/docker/cluster
+        run: |
+          python3 scripts/gen-k8s-cluster-config.py
+          git diff --exit-code k8s/cluster/01-configmap.yaml
+
+  observability:
+    name: Validate Prometheus/Alertmanager configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache promtool + amtool
+        uses: actions/cache@v4
+        with:
+          path: ~/tools/obs
+          key: promtool-2.54.1-amtool-0.27.0-linux-amd64
+
+      - name: Install promtool + amtool
+        run: |
+          mkdir -p ~/tools/obs
+          if [ ! -x ~/tools/obs/promtool ] || [ ! -x ~/tools/obs/amtool ]; then
+            curl -sSL -o /tmp/prometheus.tar.gz \
+              "https://github.com/prometheus/prometheus/releases/download/v2.54.1/prometheus-2.54.1.linux-amd64.tar.gz"
+            tar xzf /tmp/prometheus.tar.gz -C /tmp
+            curl -sSL -o /tmp/alertmanager.tar.gz \
+              "https://github.com/prometheus/alertmanager/releases/download/v0.27.0/alertmanager-0.27.0.linux-amd64.tar.gz"
+            tar xzf /tmp/alertmanager.tar.gz -C /tmp
+            mv /tmp/prometheus-2.54.1.linux-amd64/promtool ~/tools/obs/promtool
+            mv /tmp/alertmanager-0.27.0.linux-amd64/amtool ~/tools/obs/amtool
+          fi
+          sudo cp ~/tools/obs/promtool ~/tools/obs/amtool /usr/local/bin/
+
+      - name: promtool check rules
+        run: promtool check rules observability/alerts.yml
+
+      - name: promtool check config
+        # prometheus.yml's rule_files: entry is the in-container path
+        # (/etc/prometheus/alerts.yml); point a throwaway copy at the repo
+        # path instead of changing the real config just to lint it.
+        # promtool resolves rule_files: relative to the config file's own
+        # directory, not the cwd, so this has to be an absolute path.
+        run: |
+          sed "s#/etc/prometheus/alerts.yml#$(pwd)/observability/alerts.yml#" \
+            observability/prometheus.yml > /tmp/prometheus.yml
+          promtool check config /tmp/prometheus.yml
+
+      - name: amtool check-config
+        run: amtool check-config observability/alertmanager.yml

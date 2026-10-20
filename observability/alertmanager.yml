@@ -1,0 +1,36 @@
+# Minimal Alertmanager config for the demo topology. Routes everything to
+# a single webhook receiver pointed at a placeholder URL - swap `url:` for
+# a real endpoint (PagerDuty/Slack/OpsGenie webhook, or add those receiver
+# types directly) to actually get notified. The routing tree is split by
+# `severity` purely to demonstrate it; both routes hit the same receiver
+# here since there's nowhere real to send them from this demo.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default
+  group_by: ["alertname", "job"]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity="critical"
+      receiver: default
+      repeat_interval: 1h
+
+receivers:
+  - name: default
+    webhook_configs:
+      - url: "http://localhost:5001/alerts" # placeholder - point this at a real webhook receiver
+        send_resolved: true
+
+inhibit_rules:
+  # Don't page about drops/latency/forward-failures for a target that's
+  # already firing LogflowTargetDown - it's down, everything downstream
+  # of that fact is noise.
+  - source_matchers:
+      - alertname="LogflowTargetDown"
+    target_matchers:
+      - severity=~"warning|critical"
+    equal: ["job"]

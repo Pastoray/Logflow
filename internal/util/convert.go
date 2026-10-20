@@ -26,6 +26,8 @@ func FromPBEvent(e *logflowpb.Event) *channel.Event {
 	}
 }
 
+// GzipBytes compresses b, used optionally for large event bodies before they
+// cross the network.
 func GzipBytes(b []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)

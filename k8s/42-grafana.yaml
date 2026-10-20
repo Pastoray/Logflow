@@ -1,0 +1,53 @@
+# Grafana, pre-provisioned with the Prometheus datasource and the
+# "logflow" dashboard from 40-observability-config.yaml - same as
+# docker-compose.yml's grafana service, just ConfigMap mounts instead of
+# bind mounts. Anonymous admin login is enabled (GF_AUTH_ANONYMOUS_*)
+# purely so the demo dashboard is reachable with zero setup after a
+# port-forward; drop those env vars for anything beyond a local demo.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: logflow
+  labels: {app: grafana}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: grafana}
+  template:
+    metadata:
+      labels: {app: grafana}
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana-oss:11.2.0
+          env:
+            - {name: GF_AUTH_ANONYMOUS_ENABLED, value: "true"}
+            - {name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: "Admin"}
+            - {name: GF_AUTH_DISABLE_LOGIN_FORM, value: "true"}
+          ports:
+            - {name: http, containerPort: 3000}
+          volumeMounts:
+            - {name: datasources, mountPath: /etc/grafana/provisioning/datasources, readOnly: true}
+            - {name: dashboard-provider, mountPath: /etc/grafana/provisioning/dashboards, readOnly: true}
+            - {name: dashboards, mountPath: /var/lib/grafana/dashboards, readOnly: true}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - name: datasources
+          configMap: {name: grafana-provisioning, items: [{key: datasource.yml, path: datasource.yml}]}
+        - name: dashboard-provider
+          configMap: {name: grafana-provisioning, items: [{key: dashboards.yml, path: dashboards.yml}]}
+        - name: dashboards
+          configMap: {name: grafana-dashboards}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: logflow
+spec:
+  selector: {app: grafana}
+  ports:
+    - {name: http, port: 3000, targetPort: 3000}

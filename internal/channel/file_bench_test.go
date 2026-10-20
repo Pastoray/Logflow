@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+// BenchmarkFileChannelPutTake measures the allocation cost of a full
+// Put+Take round trip through the durable file channel - the hot path
+// this file's zero-copy optimizations (pooled encode buffer, aliased
+// decode body) target. Run with `go test -bench=. -benchmem ./internal/channel`.
 func BenchmarkFileChannelPutTake(b *testing.B) {
 	dir, err := os.MkdirTemp("", "logflow-bench-wal")
 	if err != nil {
@@ -38,6 +42,9 @@ func BenchmarkFileChannelPutTake(b *testing.B) {
 	}
 }
 
+// BenchmarkMemoryChannelPutTake is a baseline for comparison: the memory
+// channel never serializes at all, so its allocation profile just reflects
+// the shared Event struct itself, not any encode/decode work.
 func BenchmarkMemoryChannelPutTake(b *testing.B) {
 	mc := NewMemoryChannel("bench", 1_000_000, 4)
 	defer mc.Close()
@@ -69,5 +76,5 @@ func ExampleFileChannel_roundTrip() {
 	fc.Put(ctx, &Event{Body: []byte("hello"), Timestamp: time.Now()})
 	e, _ := fc.Take(ctx)
 	fmt.Println(string(e.Body))
-
+	// Output: hello
 }

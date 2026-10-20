@@ -1,0 +1,54 @@
+# See collector-1.yaml's header comment - same group, this is node 2 of 3.
+agent_id: collector-2
+http_addr: "127.0.0.1:9202"
+drain_timeout: 10s
+
+channels:
+  - name: main
+    type: file
+    dir: data/cluster-demo/collector-2/wal
+    capacity: 50000
+    max_segment_bytes: 67108864
+    cluster:
+      node_id: collector-2
+      data_dir: data/cluster-demo/collector-2/raft
+      peers:
+        - id: collector-1
+          addr: "127.0.0.1:8301"
+          client_addr: "127.0.0.1:8311"
+        - id: collector-2
+          addr: "127.0.0.1:8302"
+          client_addr: "127.0.0.1:8312"
+        - id: collector-3
+          addr: "127.0.0.1:8303"
+          client_addr: "127.0.0.1:8313"
+      election_timeout_min: 150ms
+      election_timeout_max: 300ms
+      heartbeat_interval: 50ms
+      apply_timeout: 5s
+      # BatchSize/BatchLinger: batch Put() calls into one Raft log entry
+      # instead of one per event - see internal/cluster/channel.go. These
+      # are the package defaults (200/50ms); spelled out here so the demo
+      # is self-documenting.
+      batch_size: 200
+      batch_linger: 50ms
+      # Raft log compaction: once 50 entries have been applied since the
+      # last snapshot, drop the applied prefix (keeping the last ~12). A
+      # tiny value so the demo shows it; real deployments want thousands.
+      snapshot_threshold: 50
+
+sources:
+  - name: from-edge
+    type: grpc
+    channel: main
+    listen_addr: "127.0.0.1:7002"
+
+sinks:
+  - name: to-disk
+    type: file
+    channel: main
+    dir: data/cluster-demo/collector-2/out
+    batch_size: 500
+    batch_linger: 200ms
+    roll_max_bytes: 134217728
+    roll_interval: 5m

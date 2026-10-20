@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/encoding/gzip" // registers "gzip" compressor
 	"google.golang.org/grpc/keepalive"
 
 	"logflow/gen/logflowpb"
@@ -33,6 +33,13 @@ type GRPCSinkConfig struct {
 	AuthToken       string
 }
 
+// GRPCSink drains a channel, batches events, and forwards them to a
+// downstream agent's Collector service over a bidirectional stream. Several
+// worker goroutines each own their own stream so a slow/blocked stream on
+// one worker doesn't stall the others (parallelism), and each worker keeps
+// several batches "in flight" - sent but not yet acked - to overlap network
+// latency with local batching (pipelining), which is what makes this
+// meaningfully faster than a naive send-wait-send-wait loop.
 type GRPCSink struct {
 	cfg     GRPCSinkConfig
 	channel channel.Channel
@@ -121,6 +128,11 @@ type inFlightBatch struct {
 	sentAt time.Time
 }
 
+// DialAndStreamOnce dials the target once and runs a single stream to
+// completion (until ctx is cancelled or the stream errors), with none of
+// the workerLoop's own reconnect/backoff. It's used directly by GRPCSink's
+// self-contained retry loop (Run) and also reused by FailoverGroup, which
+// wants to control reconnect/backoff/target-switching itself.
 func (s *GRPCSink) DialAndStreamOnce(ctx context.Context) error {
 	conn, err := s.dial(ctx)
 	if err != nil {
@@ -155,18 +167,25 @@ func (s *GRPCSink) streamLoop(ctx context.Context, conn *grpc.ClientConn, worker
 				delete(pending, ack.GetBatchId())
 			}
 			mu.Unlock()
-			<-sem
+			<-sem // free a pipeline slot
 			if !ok {
 				continue
 			}
+			if s.metrics != nil {
+				// Round-trip latency from this batch's send to its ack
+				// (success or failure) - the one piece channel/sink
+				// counters alone can't tell you: whether forwarding is
+				// fast, or merely not dropping anything while slow.
+				s.metrics.Histogram("logflow_batch_send_duration_seconds").Observe(time.Since(ib.sentAt).Seconds())
+			}
 			if ack.GetSuccess() {
 				if s.metrics != nil {
-					s.metrics.Counter("logflow_events_forwarded_total").Add(int64(len(ib.events)))
+					s.metrics.Counter("logflow_events_forwarded_total").Add(float64(len(ib.events)))
 				}
 			} else {
 				log.Printf("[sink:%s#%d] batch %s nacked: %s", s.cfg.Name, workerID, ack.GetBatchId(), ack.GetError())
 				if s.metrics != nil {
-					s.metrics.Counter("logflow_events_forward_failed_total").Add(int64(len(ib.events)))
+					s.metrics.Counter("logflow_events_forward_failed_total").Add(float64(len(ib.events)))
 				}
 			}
 		}
@@ -219,6 +238,10 @@ func (s *GRPCSink) streamLoop(ctx context.Context, conn *grpc.ClientConn, worker
 	}
 }
 
+// requeueOrDrop makes a best-effort attempt to put events that could not be
+// forwarded (e.g. the connection died mid-send) back onto the channel so a
+// future stream attempt can retry them, rather than silently losing data.
+// If the channel is already full, the event is counted as dropped.
 func (s *GRPCSink) requeueOrDrop(events []*channel.Event) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()

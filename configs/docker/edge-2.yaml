@@ -1,0 +1,34 @@
+# Edge-tier agent #2 for the docker-compose topology. Accepts events over
+# gRPC from a loadgen sidecar and load-balances forwarded batches round-robin
+# across both collectors, so killing either collector container only costs
+# the in-flight batches on that path - the other collector keeps absorbing
+# traffic and the load-balance group's retry/requeue logic recovers the rest.
+agent_id: edge-2
+http_addr: ":9100"
+drain_timeout: 30s
+
+channels:
+  - name: main
+    type: memory
+    capacity: 20000
+    shards: 4
+
+sources:
+  - name: ingest
+    type: grpc
+    channel: main
+    listen_addr: ":6000"
+
+sink_groups:
+  - name: forward-to-collectors
+    channel: main
+    processor: load_balance
+    selector: round_robin
+    targets: ["collector-1:7000", "collector-2:7000"]
+    parallelism: 4
+    batch_size: 500
+    batch_linger: 200ms
+    in_flight_batches: 8
+    max_retries: 5
+    retry_backoff: 500ms
+    compression: true

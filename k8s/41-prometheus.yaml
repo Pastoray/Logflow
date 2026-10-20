@@ -1,0 +1,54 @@
+# Prometheus, scraping the same 4 agents as docker-compose.yml's
+# prometheus service, using the exact same observability/prometheus.yml
+# and observability/alerts.yml (see 40-observability-config.yaml) - its
+# "collector-1:9101"-style targets resolve just as well via in-namespace
+# Kubernetes Service DNS as they do via Docker Compose service DNS, so
+# nothing needed changing. Alerts are evaluated here and shipped to the
+# alertmanager Service (43-alertmanager.yaml) via prometheus.yml's
+# alerting: block.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: logflow
+  labels: {app: prometheus}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: prometheus}
+  template:
+    metadata:
+      labels: {app: prometheus}
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+          ports:
+            - {name: http, containerPort: 9090}
+          volumeMounts:
+            - {name: config, mountPath: /etc/prometheus, readOnly: true}
+            - {name: rules, mountPath: /etc/prometheus/alerts.yml, subPath: alerts.yml, readOnly: true}
+            - {name: data, mountPath: /prometheus}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - name: config
+          configMap: {name: prometheus-config}
+        - name: rules
+          configMap: {name: prometheus-rules}
+        - name: data
+          emptyDir: {} # demo-scale: no PVC, metrics history doesn't need to survive a restart here
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: logflow
+spec:
+  selector: {app: prometheus}
+  ports:
+    - {name: http, port: 9090, targetPort: 9090}

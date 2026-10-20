@@ -1,3 +1,8 @@
+// Package interceptor implements Flume-style interceptors: a chain of
+// pluggable transforms that runs on every event a source admits, before it
+// reaches any channel. An interceptor can rewrite an event (e.g. add
+// headers) or drop it entirely (return nil), which is how event filtering,
+// enrichment, and tagging are done without touching source code.
 package interceptor
 
 import (
@@ -11,10 +16,14 @@ import (
 	"logflow/internal/channel"
 )
 
+// Interceptor transforms or filters a single event. Returning nil drops the
+// event - it will not reach any channel.
 type Interceptor interface {
 	Intercept(e *channel.Event) *channel.Event
 }
 
+// Chain applies a sequence of interceptors in order, short-circuiting as
+// soon as one of them drops the event.
 type Chain []Interceptor
 
 func (c Chain) Intercept(e *channel.Event) *channel.Event {
@@ -27,11 +36,16 @@ func (c Chain) Intercept(e *channel.Event) *channel.Event {
 	return e
 }
 
+// Spec is the generic, YAML-friendly description of one interceptor: a type
+// name plus a small string-keyed parameter bag. Keeping config generic here
+// (rather than one struct per interceptor type) means adding a new
+// interceptor never requires a config schema change.
 type Spec struct {
 	Type   string            `yaml:"type"`
 	Params map[string]string `yaml:"params"`
 }
 
+// Build turns a list of specs into a Chain, in order.
 func Build(specs []Spec) (Chain, error) {
 	chain := make(Chain, 0, len(specs))
 	for _, s := range specs {
@@ -98,6 +112,10 @@ func build(s Spec) (Interceptor, error) {
 	}
 }
 
+// TimestampInterceptor stamps the event with the time the agent observed
+// it, as milliseconds since epoch in a header - the conventional signal
+// downstream sinks/indexers use for "when did this happen" absent a
+// timestamp parsed from the event body itself.
 type TimestampInterceptor struct {
 	Header           string
 	PreserveExisting bool
@@ -116,6 +134,9 @@ func (t *TimestampInterceptor) Intercept(e *channel.Event) *channel.Event {
 	return e
 }
 
+// HostInterceptor tags every event with the agent's own hostname or first
+// non-loopback IP, so events can be traced back to the machine that
+// ingested them once they've been aggregated with events from many hosts.
 type HostInterceptor struct {
 	Header string
 	UseIP  bool
@@ -164,6 +185,9 @@ func firstNonLoopbackIP() string {
 	return "unknown"
 }
 
+// StaticInterceptor adds a fixed key/value header to every event - useful
+// for tagging all events from one source with, e.g., an environment or
+// tenant name.
 type StaticInterceptor struct {
 	Key   string
 	Value string
@@ -177,6 +201,10 @@ func (s *StaticInterceptor) Intercept(e *channel.Event) *channel.Event {
 	return e
 }
 
+// RegexFilterInterceptor drops events whose body does/doesn't match a
+// pattern, depending on Exclude. This is how you'd, e.g., drop DEBUG-level
+// lines before they ever reach a channel instead of paying to buffer and
+// forward them.
 type RegexFilterInterceptor struct {
 	Regexp  *regexp.Regexp
 	Exclude bool
@@ -190,6 +218,11 @@ func (r *RegexFilterInterceptor) Intercept(e *channel.Event) *channel.Event {
 	return e
 }
 
+// RegexExtractorInterceptor promotes regex capture groups from the event
+// body into headers, keyed by the group's name (?P<name>...) if present,
+// otherwise by its 1-based index - handy for pulling structured fields
+// (level, request id, ...) out of semi-structured log lines for
+// multiplexing or downstream filtering without a full parser.
 type RegexExtractorInterceptor struct {
 	Regexp     *regexp.Regexp
 	GroupNames []string

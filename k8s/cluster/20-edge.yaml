@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge
+  namespace: logflow-cluster
+  labels: {app: edge, tier: edge}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: edge}
+  template:
+    metadata:
+      labels: {app: edge, tier: edge}
+    spec:
+      containers:
+        - name: agent
+          image: logflow:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/app/configs/cluster/edge.yaml"]
+          ports:
+            - {name: grpc, containerPort: 6000}
+            - {name: http, containerPort: 9100}
+          volumeMounts:
+            - {name: config, mountPath: /app/configs/cluster, readOnly: true}
+          readinessProbe:
+            exec: {command: ["/app/healthcheck", "http://localhost:9100/healthz"]}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - name: config
+          configMap: {name: logflow-cluster-configs}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge
+  namespace: logflow-cluster
+spec:
+  selector: {app: edge}
+  ports:
+    - {name: grpc, port: 6000, targetPort: 6000}
+    - {name: http, port: 9100, targetPort: 9100}

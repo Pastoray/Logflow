@@ -1,0 +1,193 @@
+# Multi-agent logflow topology: two independent edge agents, each fed by
+# their own loadgen, load-balancing forwarded batches across two collector
+# agents that persist to disk. Mirrors the edge -> collector tiering shown
+# in configs/edge-agent.yaml + configs/collector-agent.yaml, scaled out to
+# two agents per tier so load-balancing and failover are actually exercised.
+#
+#   loadgen-1 --> edge-1 --\          /--> collector-1 (WAL + disk, volume collector1-data)
+#                            >--------<
+#   loadgen-2 --> edge-2 --/          \--> collector-2 (WAL + disk, volume collector2-data)
+#
+# Quick start (`make build` first - see Makefile; the runtime image is
+# built FROM scratch from pre-compiled binaries, not compiled by Docker
+# itself, so there's a build step before docker-build/compose-up):
+#   make compose-up
+#   curl -s http://localhost:19101/stats   # collector-1 (published on the host)
+#   curl -s http://localhost:19100/stats   # edge-1
+#
+# The runtime image has no shell (FROM scratch), so `docker compose exec`
+# won't work for a poke-around check - use the published ports above, or
+# docker compose logs, instead.
+#
+# Kill a collector to see the edges' load-balance groups route around it,
+# then bring it back and see the WAL survive the restart:
+#   docker compose stop collector-1
+#   curl -s http://localhost:19102/stats   # collector-2 picking up all the traffic
+#   docker compose start collector-1
+#
+# Prometheus + Grafana + Alertmanager (observability/): Prometheus scrapes
+# all 4 agents' real /metrics (internal/metrics, github.com/prometheus/client_golang -
+# counters, gauges, and a batch-send-latency histogram) and evaluates
+# observability/alerts.yml against them, Grafana comes pre-provisioned
+# with a "logflow" dashboard (observability/grafana/) - no manual
+# datasource/dashboard setup needed:
+#   open http://localhost:19090        # Prometheus (anonymous Grafana login is enabled for this demo)
+#   open http://localhost:19090/alerts # Alert rule states (inactive/pending/firing)
+#   open http://localhost:19093        # Alertmanager - firing alerts land here
+#   open http://localhost:13000        # Grafana - the logflow dashboard is already there
+
+services:
+  collector-1:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/agent"]
+    command: ["-config", "/app/configs/docker/collector-1.yaml"]
+    volumes:
+      - collector1-data:/app/data
+    ports:
+      - "19101:9101"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:9101/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [logflow-net]
+    restart: unless-stopped
+
+  collector-2:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/agent"]
+    command: ["-config", "/app/configs/docker/collector-2.yaml"]
+    volumes:
+      - collector2-data:/app/data
+    ports:
+      - "19102:9101"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:9101/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [logflow-net]
+    restart: unless-stopped
+
+  edge-1:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/agent"]
+    command: ["-config", "/app/configs/docker/edge-1.yaml"]
+    ports:
+      - "19100:9100"
+      - "16000:6000"
+    depends_on:
+      collector-1:
+        condition: service_healthy
+      collector-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:9100/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [logflow-net]
+    restart: unless-stopped
+
+  edge-2:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/agent"]
+    command: ["-config", "/app/configs/docker/edge-2.yaml"]
+    ports:
+      - "19103:9100"
+      - "16001:6000"
+    depends_on:
+      collector-1:
+        condition: service_healthy
+      collector-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:9100/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [logflow-net]
+    restart: unless-stopped
+
+  loadgen-1:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/loadgen"]
+    command: ["-addr", "edge-1:6000", "-rate", "2000", "-batch", "200", "-duration", "1h"]
+    depends_on:
+      edge-1:
+        condition: service_healthy
+    networks: [logflow-net]
+    restart: unless-stopped
+
+  loadgen-2:
+    build: .
+    image: logflow:latest
+    entrypoint: ["/app/loadgen"]
+    command: ["-addr", "edge-2:6000", "-rate", "2000", "-batch", "200", "-duration", "1h"]
+    depends_on:
+      edge-2:
+        condition: service_healthy
+    networks: [logflow-net]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "19090:9090"
+    networks: [logflow-net]
+    restart: unless-stopped
+    depends_on:
+      collector-1: {condition: service_healthy}
+      collector-2: {condition: service_healthy}
+      edge-1: {condition: service_healthy}
+      edge-2: {condition: service_healthy}
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "19093:9093"
+    networks: [logflow-net]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:11.2.0
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "13000:3000"
+    networks: [logflow-net]
+    restart: unless-stopped
+    depends_on: [prometheus]
+
+networks:
+  logflow-net:
+    driver: bridge
+
+volumes:
+  collector1-data:
+  collector2-data:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
