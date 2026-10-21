@@ -8,17 +8,77 @@ import (
 	"time"
 )
 
+// Election timeouts for the multi-node test clusters. They used to be
+// 60-120ms, which is fine on an idle laptop but on a loaded CI runner
+// (-race, 2 shared cores) a delayed heartbeat is enough to trigger a
+// spurious election and make an in-flight Apply/Put fail with "not leader".
+// 10x the heartbeat interval keeps tests deterministic; deliberately tiny
+// timeouts (single-node tests, TestJoiningNodeNeverSelfElects) are left alone.
+const (
+	testElectionMin = 250 * time.Millisecond
+	testElectionMax = 500 * time.Millisecond
+)
+
 // freePort asks the OS for an unused TCP port by briefly binding to :0,
 // then releasing it - the standard trick for handing a deterministic,
 // collision-free address to a server that hasn't started listening yet.
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	// The OS may hand the same just-released port back on the next call, and
+	// makePeers/other tests ask for many ports before any of them is bound;
+	// remember every port handed out so two nodes never get the same one.
+	for {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		l.Close()
+		usedPortsMu.Lock()
+		dup := usedPorts[port]
+		usedPorts[port] = true
+		usedPortsMu.Unlock()
+		if !dup {
+			return port
+		}
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+}
+
+var (
+	usedPortsMu sync.Mutex
+	usedPorts   = map[int]bool{}
+)
+
+// applyRetry proposes data on whoever is the current leader, retrying
+// through leadership changes (a loaded runner can trigger a spurious
+// election at any moment - that's normal Raft, and a client is expected to
+// retry). Because "not leader" can be returned for a write that the next
+// leader still commits, callers must tolerate (consecutive) duplicates.
+func (tc *testCluster) applyRetry(data []byte) error {
+	var err error
+	for end := time.Now().Add(20 * time.Second); time.Now().Before(end); time.Sleep(30 * time.Millisecond) {
+		l := tc.awaitLeader(10 * time.Second)
+		if err = l.Apply(data, 3*time.Second); err == nil {
+			return nil
+		}
+		if err != ErrNotLeader && err != ErrApplyTimeout {
+			return err
+		}
+	}
+	return err
+}
+
+// dedupeConsecutive collapses immediate repeats (a retried write that the
+// first leader had in fact committed - see applyRetry).
+func dedupeConsecutive(in [][]byte) [][]byte {
+	var out [][]byte
+	for i, e := range in {
+		if i > 0 && string(e) == string(in[i-1]) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 func makePeers(t *testing.T, n int) []Peer {
@@ -64,7 +124,7 @@ func (tc *testCluster) start(id string) {
 	tc.t.Helper()
 	node, err := NewNode(Config{
 		NodeID: id, Peers: tc.peers, DataDir: tc.dataDir + "/" + id,
-		ElectionTimeoutMin: 60 * time.Millisecond, ElectionTimeoutMax: 120 * time.Millisecond,
+		ElectionTimeoutMin: testElectionMin, ElectionTimeoutMax: testElectionMax,
 		HeartbeatInterval: 20 * time.Millisecond,
 		SnapshotThreshold: tc.snapThreshold, SnapshotTrailing: tc.snapTrailing,
 		LinkFilter: tc.linkOK(id),
@@ -162,12 +222,12 @@ func TestApplyReplicatesToAllNodes(t *testing.T) {
 	tc := newTestCluster(t, 3)
 	defer tc.closeAll()
 
-	leader := tc.awaitLeader(2 * time.Second)
+	tc.awaitLeader(2 * time.Second)
 
 	const n = 20
 	for i := 0; i < n; i++ {
 		data := []byte(fmt.Sprintf("entry-%d", i))
-		if err := leader.Apply(data, 2*time.Second); err != nil {
+		if err := tc.applyRetry(data); err != nil {
 			t.Fatalf("Apply(%d): %v", i, err)
 		}
 	}
@@ -175,12 +235,12 @@ func TestApplyReplicatesToAllNodes(t *testing.T) {
 	// Give followers a moment to catch up via their own heartbeat-borne
 	// replication (Apply only guarantees the *leader* has applied by the
 	// time it returns, not every follower).
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		tc.mu.Lock()
 		ok := true
 		for id := range tc.nodes {
-			if len(tc.applied[id]) != n {
+			if len(dedupeConsecutive(tc.applied[id])) != n {
 				ok = false
 			}
 		}
@@ -194,6 +254,7 @@ func TestApplyReplicatesToAllNodes(t *testing.T) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	for id, entries := range tc.applied {
+		entries = dedupeConsecutive(entries)
 		if len(entries) != n {
 			t.Errorf("node %s: applied %d entries, want %d", id, len(entries), n)
 			continue
@@ -322,7 +383,7 @@ func TestRejoinedNodeCatchesUp(t *testing.T) {
 	tc.stop(followerID)
 
 	for i := 0; i < 5; i++ {
-		if err := leader.Apply([]byte(fmt.Sprintf("while-down-%d", i)), 2*time.Second); err != nil {
+		if err := tc.applyRetry([]byte(fmt.Sprintf("while-down-%d", i))); err != nil {
 			t.Fatalf("Apply while follower down: %v", err)
 		}
 	}

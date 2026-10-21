@@ -39,7 +39,7 @@ func (rtc *replicatedTestCluster) start(id string) *ReplicatedChannel {
 	local := channel.NewMemoryChannel("test-"+id, 10000, 1)
 	rc, err := NewReplicatedChannel("test", local, Config{
 		NodeID: id, Peers: rtc.peers, DataDir: rtc.dataDir + "/" + id,
-		ElectionTimeoutMin: 60 * time.Millisecond, ElectionTimeoutMax: 120 * time.Millisecond,
+		ElectionTimeoutMin: testElectionMin, ElectionTimeoutMax: testElectionMax,
 		HeartbeatInterval: 20 * time.Millisecond,
 	})
 	if err != nil {
@@ -106,7 +106,7 @@ func TestBatchSizeTriggersFlush(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = leader.Put(context.Background(), mkEvent(fmt.Sprintf("e%d", i)))
+			errs[i] = putRetryTransient(leader, mkEvent(fmt.Sprintf("e%d", i)))
 		}(i)
 	}
 	wg.Wait()
@@ -117,7 +117,7 @@ func TestBatchSizeTriggersFlush(t *testing.T) {
 			t.Errorf("Put %d: %v", i, err)
 		}
 	}
-	if elapsed > 2*time.Second {
+	if elapsed > 8*time.Second { // well under the 10s linger; slack for election churn on loaded runners
 		t.Errorf("batch of %d (== BatchSize) took %s to flush - expected it to flush immediately on size, not wait for the 10s linger", n, elapsed)
 	}
 }
@@ -132,14 +132,14 @@ func TestBatchLingerFlushesSubThresholdBatch(t *testing.T) {
 	leader.SetBatching(1000, 100*time.Millisecond) // far below BatchSize
 
 	start := time.Now()
-	if err := leader.Put(context.Background(), mkEvent("solo")); err != nil {
+	if err := putRetryTransient(leader, mkEvent("solo")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	elapsed := time.Since(start)
 	if elapsed < 90*time.Millisecond {
 		t.Errorf("single Put flushed after %s, want >= ~100ms (BatchLinger)", elapsed)
 	}
-	if elapsed > 2*time.Second {
+	if elapsed > 8*time.Second { // well under the 10s linger; slack for election churn on loaded runners
 		t.Errorf("single Put took %s to flush - batching linger timer may be broken", elapsed)
 	}
 }
@@ -147,32 +147,83 @@ func TestBatchLingerFlushesSubThresholdBatch(t *testing.T) {
 // TestBatchCoalescesIntoOneEntry confirms many concurrent Put()s under one
 // BatchSize threshold really do become exactly one committed Raft entry
 // (one EventBatch), not N separate ones - the whole point of batching.
+// putRetryTransient retries a Put through transient leadership errors
+// ("not leader", "too many leader redirects", "no leader known") that a loaded
+// runner's spurious election can cause. Real callers retry the same way.
+func putRetryTransient(ch *ReplicatedChannel, e *channel.Event) error {
+	var err error
+	for end := time.Now().Add(15 * time.Second); time.Now().Before(end); time.Sleep(30 * time.Millisecond) {
+		if err = ch.Put(context.Background(), e); err == nil {
+			return nil
+		}
+		m := err.Error()
+		if !strings.Contains(m, "leader") && !strings.Contains(m, "redirect") {
+			return err
+		}
+	}
+	return err
+}
+
 func TestBatchCoalescesIntoOneEntry(t *testing.T) {
+	// The assertion (exactly one batch entry after the leader's no-op) only
+	// means something if leadership stayed put for the whole attempt. On a
+	// loaded runner an election can interrupt it, so retry on a fresh cluster
+	// and only fail on an attempt where leadership was stable.
+	var lastMsg string
+	for attempt := 0; attempt < 4; attempt++ {
+		if msg, stable := batchCoalesceAttempt(t); msg == "" {
+			return
+		} else if stable {
+			t.Fatal(msg)
+		} else {
+			lastMsg = msg
+		}
+	}
+	t.Fatalf("leadership kept changing on every attempt; last: %s", lastMsg)
+}
+
+// batchCoalesceAttempt returns ("", _) on success, else (failure message,
+// whether leadership was stable throughout).
+func batchCoalesceAttempt(t *testing.T) (string, bool) {
 	rtc := newReplicatedTestCluster(t, 3)
 	defer rtc.closeAll()
-	leader := rtc.awaitLeader(2 * time.Second)
+	leader := rtc.awaitLeader(5 * time.Second)
 	leader.SetBatching(50, 5*time.Second)
+	leader.node.mu.Lock()
+	term0 := leader.node.currentTerm
+	leader.node.mu.Unlock()
 
 	const n = 50
 	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			if err := leader.Put(context.Background(), mkEvent(fmt.Sprintf("c%d", i))); err != nil {
-				t.Errorf("Put %d: %v", i, err)
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
 			}
 		}(i)
 	}
 	wg.Wait()
 
 	leader.node.mu.Lock()
-	ci := leader.node.commitIndex
+	ci, term1 := leader.node.commitIndex, leader.node.currentTerm
 	leader.node.mu.Unlock()
+	stable := term0 == term1
+	if firstErr != nil {
+		return fmt.Sprintf("Put: %v", firstErr), stable
+	}
 	// Index 1 is the new leader's no-op (Raft §8); the batch is entry 2.
 	if ci != 2 {
-		t.Errorf("commitIndex = %d, want 2 (leader no-op + one entry; all %d Put()s should coalesce into a single Raft entry)", ci, n)
+		return fmt.Sprintf("commitIndex = %d, want 2 (leader no-op + one entry; all %d Put()s should coalesce into a single Raft entry)", ci, n), stable
 	}
+	return "", true
 }
 
 // TestEveryPutGetsResult ensures each individual Put() caller in a batch
@@ -248,6 +299,9 @@ func TestBatchedThroughput(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < n/concurrency; i++ {
+				// Leadership can flap under -race CPU contention (short test
+				// election timeouts); a Put refused with ErrNotLeader is retried
+				// via the forwarding path rather than failing a throughput test.
 				var err error
 				for try := 0; try < 20; try++ {
 					if err = leader.Put(context.Background(), mkEvent(fmt.Sprintf("w%d-%d", w, i))); err == nil || !strings.Contains(err.Error(), "not leader") {

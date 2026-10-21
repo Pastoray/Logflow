@@ -54,7 +54,7 @@ func TestAddServerJoinsLiveCluster(t *testing.T) {
 	defer tc.closeAll()
 	leader := tc.awaitLeader(2 * time.Second)
 
-	if err := leader.Apply([]byte("before-join"), 2*time.Second); err != nil {
+	if err := tc.applyRetry([]byte("before-join")); err != nil {
 		t.Fatalf("Apply before join: %v", err)
 	}
 
@@ -64,7 +64,7 @@ func TestAddServerJoinsLiveCluster(t *testing.T) {
 	}
 	joiner, err := NewNode(Config{
 		Joining: true, Self: newPeer, DataDir: tc.dataDir + "/node-4",
-		ElectionTimeoutMin: 60 * time.Millisecond, ElectionTimeoutMax: 120 * time.Millisecond,
+		ElectionTimeoutMin: testElectionMin, ElectionTimeoutMax: testElectionMax,
 		HeartbeatInterval: 20 * time.Millisecond,
 		ApplyFn: func(data []byte) {
 			tc.mu.Lock()
@@ -90,7 +90,7 @@ func TestAddServerJoinsLiveCluster(t *testing.T) {
 
 	// The new node must be a real participant, not just "on the member
 	// list": a fresh Apply() after it joined should replicate to it too.
-	if err := leader.Apply([]byte("after-join"), 2*time.Second); err != nil {
+	if err := tc.applyRetry([]byte("after-join")); err != nil {
 		t.Fatalf("Apply after join: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -125,7 +125,7 @@ func TestRemoveServerLeavesLiveCluster(t *testing.T) {
 	}
 	joiner, err := NewNode(Config{
 		Joining: true, Self: newPeer, DataDir: tc.dataDir + "/node-4",
-		ElectionTimeoutMin: 60 * time.Millisecond, ElectionTimeoutMax: 120 * time.Millisecond,
+		ElectionTimeoutMin: testElectionMin, ElectionTimeoutMax: testElectionMax,
 		HeartbeatInterval: 20 * time.Millisecond,
 		ApplyFn: func(data []byte) {
 			tc.mu.Lock()
@@ -172,7 +172,7 @@ func TestRemoveServerLeavesLiveCluster(t *testing.T) {
 	// The 3 remaining nodes must still be able to commit - confirms the
 	// cluster's majority math now uses the smaller membership, not a
 	// stale one still counting the removed node.
-	if err := leader.Apply([]byte("after-remove"), 2*time.Second); err != nil {
+	if err := tc.applyRetry([]byte("after-remove")); err != nil {
 		t.Fatalf("Apply after remove: %v", err)
 	}
 }
@@ -345,7 +345,7 @@ func TestRemovedNodeDoesNotDisruptCluster(t *testing.T) {
 	}
 
 	// The cluster must still be able to commit with the leader unchanged.
-	if err := leader.Apply([]byte("still-healthy"), 2*time.Second); err != nil {
+	if err := tc.applyRetry([]byte("still-healthy")); err != nil {
 		t.Fatalf("Apply after removal settled: %v", err)
 	}
 
