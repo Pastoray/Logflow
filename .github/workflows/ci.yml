@@ -4,14 +4,10 @@ name: CI
 # and validate the Docker Compose and Kubernetes deployment manifests, plus
 # the Prometheus/Alertmanager observability configs, on every push and PR.
 #
-# The module's dependencies are vendored under vendor/ (go.mod's `replace`
-# directives point at local clone paths that only existed on the machine
-# they were vendored on - see README's Building section for why). Go 1.14+
-# auto-detects vendor/ and defaults to -mod=vendor with zero network calls,
-# so every `go` invocation below works the same whether or not those
-# replace targets exist on the runner - don't add -mod=mod or `go mod
-# tidy`/`go mod download` anywhere in this file, that would try to resolve
-# them for real and fail.
+# Dependencies come from the Go module proxy and are verified against
+# go.sum (vendor/ is not committed). actions/setup-go's built-in caching
+# stores both the module cache (~/go/pkg/mod, keyed on the go.sum hash) and
+# the Go build cache, so a warm run downloads and recompiles almost nothing.
 on:
   push:
     branches: [main]
@@ -31,25 +27,19 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: false # vendor/ is already in the checkout; no module cache to warm
+          cache: true # ~/go/pkg/mod and the build cache, keyed on go.sum
+          cache-dependency-path: go.sum
 
-      # Dependencies are vendored (no module cache to warm), but the Go
-      # *build* cache - compiled vendor packages, and -race instrumented
-      # ones, which are the slow part of `go test -race` - is worth keeping.
-      # Keyed on the vendor tree + go.mod so a dependency change gets a fresh
-      # cache, with the sources hash as the most specific tier: a cache miss
-      # on source change still restores the previous (mostly valid) cache.
-      - name: Cache Go build cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/go-build
-          key: go-build-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('go.mod', 'vendor/modules.txt') }}-${{ hashFiles('**/*.go') }}
-          restore-keys: |
-            go-build-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('go.mod', 'vendor/modules.txt') }}-
-            go-build-${{ runner.os }}-${{ env.GO_VERSION }}-
+      - name: Download modules
+        run: go mod download
 
-      - name: Vendor consistency
+      - name: Verify module checksums
         run: go mod verify
+
+      - name: go.mod / go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: gofmt
         run: |
@@ -79,22 +69,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: false
+          cache: true # ~/go/pkg/mod and the build cache, keyed on go.sum
+          cache-dependency-path: go.sum
 
-      # Dependencies are vendored (no module cache to warm), but the Go
-      # *build* cache - compiled vendor packages, and -race instrumented
-      # ones, which are the slow part of `go test -race` - is worth keeping.
-      # Keyed on the vendor tree + go.mod so a dependency change gets a fresh
-      # cache, with the sources hash as the most specific tier: a cache miss
-      # on source change still restores the previous (mostly valid) cache.
-      - name: Cache Go build cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/go-build
-          key: go-build-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('go.mod', 'vendor/modules.txt') }}-${{ hashFiles('**/*.go') }}
-          restore-keys: |
-            go-build-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('go.mod', 'vendor/modules.txt') }}-
-            go-build-${{ runner.os }}-${{ env.GO_VERSION }}-
+      - name: Download modules
+        run: go mod download
 
       - name: make build
         run: make build

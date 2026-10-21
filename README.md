@@ -305,13 +305,12 @@ a slow producer or a drain that's taking longer than you want to wait for.
 go build ./...
 ```
 
-The repo vendors its full dependency tree under `vendor/` (built with
-`go mod vendor`). Go 1.14+ auto-detects a top-level `vendor/` directory and
-defaults to `-mod=vendor`, so the command above needs no network access at
-all - no `GOPROXY`, no module-proxy reachability required. This is also
-what the Docker image's build relies on (see Deployment below). To build
-against the module proxy instead (e.g. after bumping a dependency version),
-pass `-mod=mod` explicitly, then re-run `go mod vendor` to resync.
+Dependencies are fetched from the Go module proxy and verified against the
+committed `go.sum` (the repo does not vendor them). The first build needs
+network access to a module proxy; after that they are served from the local
+module cache (`~/go/pkg/mod`). To build offline, run `go mod vendor` once
+yourself (`vendor/` is git-ignored) and build with `-mod=vendor`. After
+changing a dependency, run `go mod tidy` and commit `go.mod` and `go.sum`.
 
 If you regenerate `proto/logflow.proto`, you'll need `protoc`,
 `protoc-gen-go`, and `protoc-gen-go-grpc` on your `PATH`:
@@ -434,10 +433,10 @@ stand up a realistic multi-agent topology with one command.
 **Image design.** The image is built `FROM scratch` from statically linked
 (`CGO_ENABLED=0`) binaries that are compiled first, on the host, by
 `make build` - *not* by a `golang:...` build stage inside `docker build`.
-`make build` runs `go build -mod=vendor`, which needs no network access at
-all since every dependency is vendored. This means the whole pipeline
-(`make build` then `docker build`) works with zero container-registry
-access and zero Go-module-proxy access, which also happens to make for a
+`make build` runs `go mod download` and then `go build` on the host (no
+network is needed inside `docker build` itself). This means the image build
+needs zero container-registry access - only the host's Go module proxy
+access for `make build` - which also happens to make for a
 smaller, more auditable image: nothing in it but logflow's own three
 binaries (`agent`, `loadgen`, and a tiny `healthcheck` probe - see below)
 and a CA bundle, no base-image CVEs to track. If you're building somewhere
@@ -888,18 +887,15 @@ independent jobs:
 | `manifests` | `kustomize build k8s/` - renders every object in `k8s/`, catching bad `kustomization.yaml` entries, malformed YAML, or broken ConfigMap/volume references |
 | `observability` | `promtool check rules`/`check config` and `amtool check-config` against the real `observability/*.yml` files, using the same Prometheus/Alertmanager release binaries the Verified behavior section downloads below |
 
-No step needs `go mod download`, `go mod tidy`, or anything else that
-would try to resolve the `replace` directives in `go.mod` for real - the
-vendored `vendor/` tree is checked into the repo, and Go 1.14+ auto-detects
-it and defaults to `-mod=vendor` with zero network calls, the same way
-every build in this README does.
+Dependencies are not vendored: each job downloads modules from the Go module
+proxy (`go mod download`) and `go mod verify` checks them against `go.sum`.
+The `test` job also runs `go mod tidy` and fails if that changes `go.mod` or
+`go.sum`, so those files can't drift from the imports.
 
-Caching (`actions/cache@v4`): the Go *build* cache (`~/.cache/go-build`,
-including `-race`-instrumented packages) is keyed on Go version + `go.mod` +
-`vendor/modules.txt` + a hash of the sources, falling back to the previous
-cache on a source-only change; the downloaded `kustomize`, `promtool` and
-`amtool` binaries are cached by version. There is no module-download cache
-because dependencies are vendored. The `manifests` job also renders
+Caching: `actions/setup-go` (`cache: true`, `cache-dependency-path: go.sum`)
+caches the module cache (`~/go/pkg/mod`, keyed on the `go.sum` hash) and the
+Go build cache; the downloaded `kustomize`, `promtool` and `amtool` binaries
+are cached by version with `actions/cache@v4`. The `manifests` job also renders
 `k8s/cluster/` and fails if `k8s/cluster/01-configmap.yaml` is out of sync
 with `configs/docker/cluster/`; the `docker` job also checks
 `docker-compose.cluster.yml`. Not verified: an actual runner has never
@@ -909,8 +905,9 @@ executed any of this (the workflow was only YAML-parsed here).
 
 This was built and exercised end-to-end across two sandboxed environments
 with no `proxy.golang.org` access (dependencies were fetched directly from
-GitHub source and vendored under `vendor/` for this reason - see Building
-above; a normal machine just needs `go build ./...`), using Go 1.22 for
+GitHub source and vendored locally for this reason, with a `replace` block in
+`go.mod` that was removed before publishing; a normal machine just needs
+`go build ./...`), using Go 1.22 for
 the original feature work and Go 1.24 for the Docker deployment work:
 
 - Standalone agent sustained **~19,900 events/sec** end-to-end
@@ -1049,8 +1046,8 @@ access, and it turned out to also be a legitimately smaller/more
 auditable image, not just a workaround.
 
 - `make build` compiled `agent`/`loadgen`/`healthcheck` as static Linux
-  binaries using only `vendor/` - confirmed zero network calls needed
-  (`go build -mod=vendor` with no `GOPROXY`/`GOFLAGS` overrides).
+  binaries from the locally vendored dependencies (at the time: no network
+  calls needed; the published repo now fetches modules via `go mod download`).
 - `docker build` produced a **40.6MB** image (11.7MB uncompressed content)
   with no `FROM` pull at all - confirmed via the build log showing every
   step as a local `COPY`, nothing fetched.
@@ -1135,6 +1132,15 @@ auditable image, not just a workaround.
   machine), with a test that fails without it. This is in-process partition
   simulation, not Jepsen-style testing (no clock skew, disk faults or real
   network).
+- A second chaos-test finding, fixed: `Apply` reported success once
+  `lastApplied >= index`, which only means *some* entry at that index was
+  applied. A leader partitioned away mid-write could, after healing, have its
+  slot overwritten by the new leader's entry and still acknowledge its own
+  write - a lost acknowledged write (12 consecutive chaos runs now pass; it
+  failed within 12 before). `Apply` now acknowledges only if the entry at its
+  index still has its own term; otherwise it returns `ErrNotLeader` so the
+  caller retries (at-least-once). Deterministic regression test
+  `TestApplyNotAckedWhenEntryOverwritten` fails without the fix.
 - Load-balance failover under a real container kill: `docker stop
   collector-1` while traffic was flowing - both edges immediately started
   logging reconnect attempts to `collector-1:7000` (DNS removed along with

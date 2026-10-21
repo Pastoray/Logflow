@@ -1,17 +1,19 @@
-.PHONY: build docker-build compose-up compose-down clean
+.PHONY: deps build docker-build compose-up compose-down clean
 
-GOFLAGS_OFFLINE := -mod=vendor
 LDFLAGS := -s -w
 
-# Compiles agent/loadgen/healthcheck as static Linux binaries into dist/,
-# using only the vendored module cache - no network access needed. This is
-# the step `docker build` depends on (see Dockerfile): Docker just packages
-# these into a scratch image, it doesn't compile them.
-build:
+# Fetches modules (cached in ~/go/pkg/mod after the first run).
+deps:
+	go mod download
+
+# Compiles agent/loadgen/healthcheck as static Linux binaries into dist/.
+# This is the step `docker build` depends on (see Dockerfile): Docker just
+# packages these into a scratch image, it doesn't compile them.
+build: deps
 	mkdir -p dist
-	CGO_ENABLED=0 GOOS=linux go build $(GOFLAGS_OFFLINE) -trimpath -ldflags="$(LDFLAGS)" -o dist/agent ./cmd/agent
-	CGO_ENABLED=0 GOOS=linux go build $(GOFLAGS_OFFLINE) -trimpath -ldflags="$(LDFLAGS)" -o dist/loadgen ./cmd/loadgen
-	CGO_ENABLED=0 GOOS=linux go build $(GOFLAGS_OFFLINE) -trimpath -ldflags="$(LDFLAGS)" -o dist/healthcheck ./cmd/healthcheck
+	CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="$(LDFLAGS)" -o dist/agent ./cmd/agent
+	CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="$(LDFLAGS)" -o dist/loadgen ./cmd/loadgen
+	CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="$(LDFLAGS)" -o dist/healthcheck ./cmd/healthcheck
 	cp /etc/ssl/certs/ca-certificates.crt dist/ca-certificates.crt
 
 docker-build: build

@@ -997,9 +997,24 @@ func (n *Node) replicateAndWaitCommitted(targetIdx, term uint64, timeout time.Du
 		n.mu.Lock()
 		applied := n.lastApplied >= targetIdx
 		stillLeader := n.state == Leader && n.currentTerm == term
-		n.mu.Unlock()
+		// lastApplied >= targetIdx only means SOME entry at that index was
+		// applied; a partitioned leader's slot may have been overwritten.
+		// Only our own entry (same term) counts; if compacted away we can
+		// only vouch for it while still leader of the same term.
+		overwritten := false
 		if applied {
+			if t, ok := n.termAtLocked(targetIdx); ok {
+				overwritten = t != term
+			} else {
+				overwritten = !stillLeader
+			}
+		}
+		n.mu.Unlock()
+		if applied && !overwritten {
 			return nil
+		}
+		if overwritten {
+			return ErrNotLeader
 		}
 		if !stillLeader {
 			return ErrNotLeader

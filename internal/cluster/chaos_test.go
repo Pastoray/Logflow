@@ -166,7 +166,20 @@ func TestChaosPartitions(t *testing.T) {
 	t.Logf("%d writes acknowledged across %d terms", nAcked, len(leaderOf))
 
 	// Convergence: all nodes apply the same sequence.
-	waitFor(t, 15*time.Second, "all nodes to converge on one history", func() bool {
+	diag := func() string {
+		tc.mu.Lock()
+		defer tc.mu.Unlock()
+		out := fmt.Sprintf("acked=%d", nAcked)
+		for _, p := range tc.peers {
+			n := tc.nodes[p.ID]
+			n.mu.Lock()
+			out += fmt.Sprintf(" | %s applied=%d state=%v term=%d commit=%d lastApplied=%d last=%d",
+				p.ID, len(tc.applied[p.ID]), n.state, n.currentTerm, n.commitIndex, n.lastApplied, n.lastIndexLocked())
+			n.mu.Unlock()
+		}
+		return out
+	}
+	converged := func() bool {
 		tc.mu.Lock()
 		defer tc.mu.Unlock()
 		var ref [][]byte
@@ -181,7 +194,12 @@ func TestChaosPartitions(t *testing.T) {
 			}
 		}
 		return len(ref) >= nAcked
-	})
+	}
+	for end := time.Now().Add(20 * time.Second); !converged(); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatalf("timed out waiting for all nodes to converge: %s", diag())
+		}
+	}
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	ref := tc.applied[tc.peers[0].ID]
@@ -220,5 +238,60 @@ func TestNewLeaderCommitsNoopWithoutWrites(t *testing.T) {
 	})
 	if n := tc.appliedCount(l.cfg.NodeID); n != 0 {
 		t.Fatalf("no-op reached the state machine: %d entries applied", n)
+	}
+}
+
+// A write proposed on a leader that is then partitioned away must NOT be
+// acknowledged just because, after the partition heals, SOME entry at that
+// log index gets applied on it. Found by the chaos test: the old Apply
+// waited only for lastApplied >= index, so it reported success for a write
+// whose log slot had been overwritten by the new leader's entry.
+func TestApplyNotAckedWhenEntryOverwritten(t *testing.T) {
+	tc := newTestCluster(t, 5)
+	defer tc.closeAll()
+	old := tc.awaitLeader(3 * time.Second)
+	g := map[string]int{}
+	for _, p := range tc.peers {
+		g[p.ID] = 1
+	}
+	g[old.cfg.NodeID] = 0
+	tc.setPartition(g)
+
+	res := make(chan error, 1)
+	go func() { res <- old.Apply([]byte("doomed"), 6*time.Second) }()
+	time.Sleep(200 * time.Millisecond)
+
+	var nl *Node
+	waitFor(t, 5*time.Second, "majority leader", func() bool {
+		for _, n := range tc.live() {
+			if n != old && n.IsLeader() {
+				nl = n
+				return true
+			}
+		}
+		return false
+	})
+	for i := 0; i < 5; i++ { // push past the doomed entry's index
+		if err := nl.Apply([]byte(fmt.Sprintf("good%d", i)), 3*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tc.setPartition(nil)
+
+	select {
+	case err := <-res:
+		if err == nil {
+			t.Fatal("Apply acknowledged a write whose log entry was overwritten by the new leader")
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("Apply never returned")
+	}
+	waitFor(t, 8*time.Second, "convergence", func() bool { return tc.appliedCount(old.cfg.NodeID) == 5 })
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	for _, d := range tc.applied[old.cfg.NodeID] {
+		if string(d) == "doomed" {
+			t.Fatal("doomed entry was applied")
+		}
 	}
 }

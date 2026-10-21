@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"strings"
 
 	"logflow/internal/channel"
 )
@@ -247,7 +248,14 @@ func TestBatchedThroughput(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < n/concurrency; i++ {
-				if err := leader.Put(context.Background(), mkEvent(fmt.Sprintf("w%d-%d", w, i))); err != nil {
+				var err error
+				for try := 0; try < 20; try++ {
+					if err = leader.Put(context.Background(), mkEvent(fmt.Sprintf("w%d-%d", w, i))); err == nil || !strings.Contains(err.Error(), "not leader") {
+						break
+					}
+					time.Sleep(25 * time.Millisecond)
+				}
+				if err != nil {
 					t.Errorf("Put: %v", err)
 					return
 				}

@@ -3,9 +3,9 @@
 # This Dockerfile intentionally does NOT use a `FROM golang:... AS builder`
 # multi-stage pull. It's built FROM scratch and just packages statically
 # linked binaries that are compiled first, on the host, via `make build`
-# (see Makefile) - a plain `CGO_ENABLED=0 go build -mod=vendor ...` that
-# needs no network access at all, since every dependency is already
-# vendored under vendor/.
+# (see Makefile) - a plain `CGO_ENABLED=0 go build ...`. Modules are
+# fetched by `make build` on the host (`go mod download`, verified against
+# go.sum), not inside `docker build`.
 #
 # Why: this keeps the whole pipeline - `make build` then `docker build` -
 # usable in locked-down environments with no container-registry egress at
@@ -17,7 +17,7 @@
 # If you're building this somewhere with normal registry access and would
 # rather have Docker do the compilation too, replace this file's single
 # stage with a standard `FROM golang:1.24-alpine AS builder` stage running
-# the same `go build -mod=vendor` commands from the Makefile, then copy
+# the same `go build` commands from the Makefile, then copy
 # /out/* into this same scratch stage below - nothing else here changes.
 
 FROM scratch
