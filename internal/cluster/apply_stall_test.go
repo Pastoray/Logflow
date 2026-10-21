@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -132,7 +133,7 @@ func TestApplyOrderingWaitsForApplyFn(t *testing.T) {
 		release[id] = make(chan struct{})
 		n, err := NewNode(Config{
 			NodeID: id, Peers: peers, DataDir: dataDir + "/" + id,
-			ElectionTimeoutMin: 60 * time.Millisecond, ElectionTimeoutMax: 120 * time.Millisecond,
+			ElectionTimeoutMin: testElectionMin, ElectionTimeoutMax: testElectionMax,
 			HeartbeatInterval: 20 * time.Millisecond,
 			ApplyFn: func(data []byte) {
 				select {
@@ -153,28 +154,45 @@ func TestApplyOrderingWaitsForApplyFn(t *testing.T) {
 		}
 	}()
 
-	var leader *Node
-	deadline := time.Now().Add(3 * time.Second)
-	for leader == nil && time.Now().Before(deadline) {
-		for _, n := range nodes {
-			if n.IsLeader() {
-				leader = n
-			}
+	// Leadership can legitimately change under CPU contention (a spurious
+	// election). Apply then returns ErrNotLeader, which says nothing about
+	// ApplyFn ordering, so retry on whoever leads now. The property is only
+	// checked on an attempt where the armed leader kept its leadership.
+	var id string
+	var done chan error
+	for attempt := 0; ; attempt++ {
+		if attempt == 8 {
+			t.Fatal("leadership never stabilised")
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if leader == nil {
-		t.Fatal("no leader")
-	}
-	id := leader.cfg.NodeID
-	armed[id] <- struct{}{}
-
-	done := make(chan error, 1)
-	go func() { done <- leader.Apply([]byte("e1"), 5*time.Second) }()
-	select {
-	case err := <-done:
-		t.Fatalf("Apply returned (%v) before the leader's ApplyFn finished", err)
-	case <-time.After(400 * time.Millisecond):
+		var leader *Node
+		deadline := time.Now().Add(5 * time.Second)
+		for leader == nil && time.Now().Before(deadline) {
+			for _, n := range nodes {
+				if n.IsLeader() {
+					leader = n
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if leader == nil {
+			t.Fatal("no leader")
+		}
+		id = leader.cfg.NodeID
+		select {
+		case armed[id] <- struct{}{}:
+		default:
+		}
+		done = make(chan error, 1)
+		go func(l *Node, d chan error) { d <- l.Apply([]byte("e1"), 5*time.Second) }(leader, done)
+		select {
+		case err := <-done:
+			if err != nil && strings.Contains(err.Error(), "not leader") {
+				continue // leadership flipped; retry
+			}
+			t.Fatalf("Apply returned (%v) before the leader's ApplyFn finished", err)
+		case <-time.After(400 * time.Millisecond):
+		}
+		break
 	}
 	close(release[id])
 	select {
