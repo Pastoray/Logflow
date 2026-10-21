@@ -3,10 +3,10 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
-	"strings"
 
 	"logflow/internal/channel"
 )
